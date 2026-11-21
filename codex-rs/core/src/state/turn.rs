@@ -83,6 +83,8 @@ pub(crate) enum TaskKind {
     Regular,
     Review,
     Compact,
+    /// Automatic standalone compaction, which yields to new user input.
+    IdleCompact,
 }
 
 pub(crate) struct RunningTask {

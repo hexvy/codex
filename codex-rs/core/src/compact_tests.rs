@@ -188,6 +188,7 @@ async fn local_compaction_retries_preserve_instructions_and_tool_metadata(
         vec![ResolvedUserInput::text(
             "Summarize the conversation.".to_string(),
         )],
+        /*idle*/ false,
     )
     .await?;
 

@@ -1446,6 +1446,27 @@ impl ChatWidget {
         }
     }
 
+    /// A steer retried as a new turn must no longer be restored by the old
+    /// turn's interruption notification after the new start was accepted.
+    pub(crate) fn promote_pending_steer_to_started_turn(&mut self, client_id: &str) {
+        let Some(index) = self
+            .input_queue
+            .pending_steers
+            .iter()
+            .position(|steer| steer.client_id == client_id)
+        else {
+            return;
+        };
+        let Some(pending) = self.input_queue.pending_steers.remove(index) else {
+            return;
+        };
+        self.refresh_pending_input_preview();
+        let display =
+            user_message_display_for_history(pending.user_message, &pending.history_record);
+        self.on_user_message_display(display);
+        self.last_rendered_user_message_client_id = Some(pending.client_id);
+    }
+
     fn on_user_message_display(&mut self, display: UserMessageDisplay) {
         self.transcript.last_status_copy_targets = None;
         self.last_rendered_user_message_display = Some(display.clone());

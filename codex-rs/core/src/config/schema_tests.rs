@@ -75,6 +75,30 @@ fn config_schema_hides_unsupported_inline_mcp_bearer_token() {
 }
 
 #[test]
+fn idle_compact_schema_accepts_a_boolean_or_feature_table() {
+    let schema_json = config_schema_json().expect("serialize config schema");
+    let schema: serde_json::Value = serde_json::from_slice(&schema_json).expect("decode schema");
+    assert_eq!(
+        schema.pointer("/properties/features/properties/idle_compact/$ref"),
+        Some(&serde_json::json!(
+            "#/definitions/FeatureToml_for_IdleCompactConfigToml"
+        ))
+    );
+    assert_eq!(
+        schema.pointer("/definitions/FeatureToml_for_IdleCompactConfigToml/anyOf"),
+        Some(&serde_json::json!([
+            {"type": "boolean"},
+            {"$ref": "#/definitions/IdleCompactConfigToml"}
+        ]))
+    );
+    assert!(
+        schema
+            .pointer("/definitions/IdleCompactConfigToml/properties/providers")
+            .is_some()
+    );
+}
+
+#[test]
 fn shell_environment_policy_schema_rejects_mixed_filter_representations() {
     let schema_json = config_schema_json().expect("serialize config schema");
     let schema_value: serde_json::Value =

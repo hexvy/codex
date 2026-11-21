@@ -36,6 +36,9 @@ use crate::context::ContextualUserFragment;
 use crate::hook_runtime::run_turn_interrupt_hooks;
 use crate::session::SamplingInterrupt;
 use crate::session::TurnInput;
+use crate::session::idle_compaction::IdleCompactionSchedule;
+use crate::session::idle_compaction::IdleCompactionStart;
+use crate::session::idle_compaction::WorkerIdleCompaction;
 use crate::session::session::Session;
 use crate::session::turn::McpStartupRequirements;
 use crate::session::turn::run_hooks_and_record_inputs;
@@ -214,6 +217,11 @@ pub(crate) trait SessionTask: Send + Sync + 'static {
     /// Returns the tracing name for a spawned task span.
     fn span_name(&self) -> &'static str;
 
+    /// Only model turns, not reviews, shell commands, or compaction, arm idle compaction.
+    fn schedules_idle_compaction(&self) -> bool {
+        false
+    }
+
     /// Executes the task until completion or cancellation.
     ///
     /// Implementations typically stream protocol events using `session` and
@@ -253,6 +261,8 @@ pub(crate) trait AnySessionTask: Send + Sync + 'static {
 
     fn span_name(&self) -> &'static str;
 
+    fn schedules_idle_compaction(&self) -> bool;
+
     fn run(
         self: Arc<Self>,
         session: Arc<Session>,
@@ -274,6 +284,10 @@ where
 
     fn span_name(&self) -> &'static str {
         SessionTask::span_name(self)
+    }
+
+    fn schedules_idle_compaction(&self) -> bool {
+        SessionTask::schedules_idle_compaction(self)
     }
 
     fn run(
@@ -309,16 +323,59 @@ impl Session {
         self.start_task(turn_context, input, task).await
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "register the turn and its pending input atomically with the suspension fence"
-    )]
     pub(crate) async fn start_task<T: SessionTask>(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
         input: Vec<TurnInput>,
         task: T,
     ) -> TurnInputSubmission {
+        Box::pin(self.start_task_inner(turn_context, input, task, None)).await
+    }
+
+    pub(crate) async fn start_reserved_idle_compaction(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        turn_state: &Arc<Mutex<TurnState>>,
+        schedule: &IdleCompactionSchedule,
+    ) -> bool {
+        if turn_context.session_source.is_non_root_agent() {
+            turn_context.extension_data.insert(WorkerIdleCompaction);
+        }
+        matches!(
+            Box::pin(self.start_task_inner(
+                turn_context,
+                Vec::new(),
+                CompactTask::idle(),
+                Some((turn_state, schedule))
+            ))
+            .await,
+            TurnInputSubmission::Started { .. }
+        )
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "register the turn and its pending input atomically with the suspension fence"
+    )]
+    async fn start_task_inner<T: SessionTask>(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        input: Vec<TurnInput>,
+        task: T,
+        idle_reservation: Option<(&Arc<Mutex<TurnState>>, &IdleCompactionSchedule)>,
+    ) -> TurnInputSubmission {
+        if let Some((expected, schedule)) = idle_reservation {
+            let active = self.active_turn.lock().await;
+            if active
+                .as_ref()
+                .is_none_or(|turn| turn.task.is_some() || !Arc::ptr_eq(&turn.turn_state, expected))
+                || !self.idle_compaction_is_current(schedule)
+            {
+                return TurnInputSubmission::NotSubmitted {
+                    reason: NotSubmittedReason::Superseded,
+                };
+            }
+        }
         // Replace the cache; in-flight acquisitions retain their previous Arc.
         self.services
             .thread_extension_data
@@ -365,7 +422,25 @@ impl Session {
                     reason: NotSubmittedReason::ServerDraining,
                 };
             }
-            let turn = active.get_or_insert_with(ActiveTurn::default);
+            let turn = if let Some((expected, schedule)) = idle_reservation {
+                let Some(turn) = active
+                    .as_mut()
+                    .filter(|turn| turn.task.is_none() && Arc::ptr_eq(&turn.turn_state, expected))
+                else {
+                    return TurnInputSubmission::NotSubmitted {
+                        reason: NotSubmittedReason::Superseded,
+                    };
+                };
+                if !self.idle_compaction_is_current(schedule) {
+                    return TurnInputSubmission::NotSubmitted {
+                        reason: NotSubmittedReason::Superseded,
+                    };
+                }
+                turn
+            } else {
+                active.get_or_insert_with(ActiveTurn::default)
+            };
+
             debug_assert!(turn.task.is_none());
             turn.turn_id = Some(turn_context.sub_id.clone());
             turn.finishing = None;
@@ -380,6 +455,7 @@ impl Session {
         .await;
 
         let mut active = self.active_turn.lock().await;
+
         // Shutdown closes registration before taking this same lock to abort active work.
         if self.turn_starts_closed() {
             return TurnInputSubmission::NotSubmitted {
@@ -396,6 +472,26 @@ impl Session {
                             || turn_context.session_source.get_agent_path().is_some())
             })
             .map(|reporting| reporting.handoffs.token());
+        if let Some((expected, schedule)) = idle_reservation {
+            let valid = active
+                .as_ref()
+                .is_some_and(|turn| turn.task.is_none() && Arc::ptr_eq(&turn.turn_state, expected));
+            if !valid
+                || !self
+                    .claim_idle_compaction(schedule, &turn_context.sub_id)
+                    .await
+            {
+                drop(active);
+                self.emit_turn_abort_lifecycle(
+                    TurnAbortReason::Replaced,
+                    turn_context.extension_data.as_ref(),
+                )
+                .await;
+                return TurnInputSubmission::NotSubmitted {
+                    reason: NotSubmittedReason::Superseded,
+                };
+            }
+        }
         let Some(turn) = active
             .as_mut()
             .filter(|turn| Arc::ptr_eq(&turn.turn_state, &turn_state))
@@ -406,16 +502,23 @@ impl Session {
         };
         debug_assert!(turn.task.is_none());
         // Keep mail in its queue until a task owns it. Suspension can save it if it wins this lock.
-        let (pending_items, _) = self.input_queue.drain_mailbox_input_items().await;
-        self.input_queue
-            .extend_pending_input_for_turn_state(&turn_state, pending_items)
-            .await;
+        if task_kind != TaskKind::IdleCompact {
+            let (pending_items, _) = self.input_queue.drain_mailbox_input_items().await;
+            self.input_queue
+                .extend_pending_input_for_turn_state(&turn_state, pending_items)
+                .await;
+        }
         // Record lineage only when the task starts: settings changes can invalidate a reservation.
-        self.record_started_turn(
-            &turn_context.sub_id,
-            (task_kind == TaskKind::Regular).then(|| turn_context.attribution()),
-        )
-        .await;
+        if idle_reservation.is_none() {
+            if task.schedules_idle_compaction() || task_kind == TaskKind::Compact {
+                self.cancel_idle_compaction();
+            }
+            self.record_started_turn(
+                &turn_context.sub_id,
+                (task_kind == TaskKind::Regular).then(|| turn_context.attribution()),
+            )
+            .await;
+        }
         self.bind_realtime_handoffs_to_turn(&input, &turn_context.sub_id)
             .await;
         let host_admission = self.host_turn_admission();
@@ -430,6 +533,7 @@ impl Session {
                 None,
             ),
         };
+
         let done_clone = Arc::clone(&done);
         let session = Arc::clone(self);
         let ctx = Arc::clone(&turn_context);
@@ -486,6 +590,7 @@ impl Session {
                     .await
             }.await;
             loop {
+                let idle_since = IdleCompactionStart::now();
                 // Private reviewers save their transcript together with the terminal event.
                 // Errors and cancellation retain their existing save path.
                 if (!session.is_private_guardian_reviewer().await
@@ -508,7 +613,7 @@ impl Session {
                     break;
                 }
                 let Some(requirements) = session
-                    .on_task_finished(Arc::clone(&ctx_for_finish), task_result)
+                    .on_task_finished(Arc::clone(&ctx_for_finish), task_result, idle_since)
                     .await
                 else {
                     break;
@@ -522,6 +627,7 @@ impl Session {
                     task_cancellation_token.child_token(),
                 )
                 .await;
+
             }
             done_clone.notify_waiters();
         }
@@ -711,12 +817,12 @@ impl Session {
             let task = active_turn.task.take();
             aborted_turn = task.is_some();
             if let Some(task) = task {
-                self.handle_task_abort(
+                Box::pin(self.handle_task_abort(
                     task,
                     reason.clone(),
                     &active_turn.turn_state,
                     /*error*/ None,
-                )
+                ))
                 .await;
             }
             if aborted_turn {
@@ -730,7 +836,7 @@ impl Session {
             self.input_queue.clear_pending(&active_turn).await;
         }
         if reason == TurnAbortReason::Interrupted && aborted_turn {
-            self.maybe_start_turn_for_pending_work().await;
+            Box::pin(self.maybe_start_turn_for_pending_work()).await;
         }
     }
 
@@ -762,7 +868,8 @@ impl Session {
         if matches!(
             reason,
             TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited
-        ) {
+        ) && turn.extension_data.get::<WorkerIdleCompaction>().is_none()
+        {
             self.mark_interrupted();
         }
         active.take()
@@ -776,7 +883,7 @@ impl Session {
     ) {
         let task = active_turn.task.take();
         if let Some(task) = task {
-            self.handle_task_abort(task, reason.clone(), &active_turn.turn_state, error)
+            Box::pin(self.handle_task_abort(task, reason.clone(), &active_turn.turn_state, error))
                 .await;
         }
         // Let interrupted tasks observe cancellation before dropping pending approvals, or an
@@ -784,7 +891,7 @@ impl Session {
         self.input_queue.clear_pending(&active_turn).await;
 
         if reason == TurnAbortReason::Interrupted {
-            self.maybe_start_turn_for_pending_work().await;
+            Box::pin(self.maybe_start_turn_for_pending_work()).await;
         }
     }
 
@@ -797,6 +904,7 @@ impl Session {
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
         task_result: SessionTaskResult,
+        idle_since: IdleCompactionStart,
     ) -> Option<McpStartupRequirements> {
         let (regular_output, abort, task_error) = match task_result {
             Ok(output) => (output, None, None),
@@ -815,7 +923,14 @@ impl Session {
             && !self.work_budget().is_exhausted();
         let finishing = CancellationToken::new();
         let finish_recording = finishing.clone().drop_guard();
-        let (turn_state, unadmitted_task, mut pending_input, outcome_handoff, sampling_interrupted) = {
+        let (
+            turn_state,
+            unadmitted_task,
+            mut pending_input,
+            outcome_handoff,
+            sampling_interrupted,
+            schedules_idle_compaction,
+        ) = {
             let mut active = self.active_turn.lock().await;
             let active_turn = active.as_mut()?;
             if !Arc::ptr_eq(&active_turn.task.as_ref()?.turn_context, &turn_context) {
@@ -836,6 +951,7 @@ impl Session {
             let task = active_turn.task.take()?;
             task.handle.detach();
             active_turn.finishing = Some(finishing);
+            let schedules_idle_compaction = task.task.schedules_idle_compaction();
             (
                 Arc::clone(&active_turn.turn_state),
                 (task._agent_execution_guard.is_none() && task.pending_initial_input.is_some())
@@ -843,22 +959,26 @@ impl Session {
                 task.pending_initial_input.unwrap_or_default(),
                 task.outcome_handoff,
                 sampling_interrupted,
+                schedules_idle_compaction,
             )
         };
         turn_context
             .turn_metadata_state
             .cancel_git_enrichment_task();
+
         let last_agent_message = regular_output.and_then(|output| output.last_agent_message);
         pending_input.extend(
             self.input_queue
                 .take_pending_input_for_turn_state(turn_state.as_ref())
                 .await,
         );
+
         let (
             turn_had_memory_citation,
             turn_tool_calls,
             token_usage_at_turn_start,
             token_usage_by_model,
+            last_model,
         ) = {
             let mut ts = turn_state.lock().await;
             (
@@ -866,6 +986,9 @@ impl Session {
                 ts.tool_calls,
                 ts.token_usage_at_turn_start.clone(),
                 std::mem::take(&mut ts.token_usage_by_model),
+                ts.last_known_step_context
+                    .as_ref()
+                    .map(|step| step.settings.model_info.slug.clone()),
             )
         };
         let model_info = turn_context.capture_current_model_info();
@@ -1097,16 +1220,30 @@ impl Session {
             self.send_event(turn_context.as_ref(), event.clone()).await;
         }
 
-        let cleared_active_turn = {
+        let (cleared_active_turn, idle_compaction) = {
             let mut active = self.active_turn.lock().await;
             if let Some(active_turn) = active.as_ref()
                 && active_turn.task.is_none()
                 && Arc::ptr_eq(&active_turn.turn_state, &turn_state)
             {
+                let idle_compaction = if schedules_idle_compaction
+                    && !sampling_interrupted
+                    && turn_context.config.features.enabled(Feature::IdleCompact)
+                {
+                    self.prepare_idle_compaction(
+                        &turn_context,
+                        idle_cause,
+                        last_model.as_deref(),
+                        idle_since,
+                    )
+                    .await
+                } else {
+                    None
+                };
                 *active = None;
-                true
+                (true, idle_compaction)
             } else {
-                false
+                (false, None)
             }
         };
         if saved_guardian_completion {
@@ -1125,6 +1262,10 @@ impl Session {
         }
         if cleared_active_turn {
             self.maybe_start_turn_for_pending_work().await;
+        }
+
+        if let Some(schedule) = idle_compaction {
+            self.arm_idle_compaction(&schedule);
         }
         None
     }
@@ -1146,12 +1287,22 @@ impl Session {
         mut active: MutexGuard<'_, Option<ActiveTurn>>,
         reason: &TurnAbortReason,
     ) -> Option<ActiveTurn> {
+        if *reason == TurnAbortReason::Interrupted {
+            self.cancel_idle_compaction();
+        }
         if matches!(
             reason,
             TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited
         ) && active.as_ref().is_some_and(|turn| {
-            turn.task.is_some()
-                || (self.enabled(Feature::WakeOnAgentMessages) && turn.finishing.is_none())
+            turn.task.as_ref().map_or_else(
+                || self.enabled(Feature::WakeOnAgentMessages) && turn.finishing.is_none(),
+                |task| {
+                    task.turn_context
+                        .extension_data
+                        .get::<WorkerIdleCompaction>()
+                        .is_none()
+                },
+            )
         }) {
             // A message wake can reserve work before registering a task. Mark
             // it interrupted too, but leave a finishing turn's status intact

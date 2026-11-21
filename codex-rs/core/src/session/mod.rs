@@ -1,3 +1,4 @@
+pub(crate) mod idle_compaction;
 pub(crate) mod startup;
 
 use crate::McpRefreshReason;
@@ -2804,9 +2805,20 @@ impl Session {
                 .analytics_events_client
                 .track_guardian_session_event(self.thread_id, &event);
         }
-        self.send_event_raw(event).await;
-        self.maybe_publish_terminal_agent_result(turn_context, &legacy_source)
-            .await;
+        let update_agent_status = turn_context
+            .extension_data
+            .get::<idle_compaction::WorkerIdleCompaction>()
+            .is_none();
+        Box::pin(self.send_event_raw_with_persistence(
+            event,
+            /*persist*/ true,
+            update_agent_status,
+        ))
+        .await;
+        if update_agent_status {
+            self.maybe_publish_terminal_agent_result(turn_context, &legacy_source)
+                .await;
+        }
         self.maybe_mirror_event_text_to_realtime(&legacy_source)
             .await;
         self.maybe_clear_realtime_handoff_for_event(&legacy_source)
@@ -2821,7 +2833,12 @@ impl Session {
                 id: turn_context.sub_id.clone(),
                 msg: legacy,
             };
-            self.send_event_raw(legacy_event).await;
+            Box::pin(self.send_event_raw_with_persistence(
+                legacy_event,
+                /*persist*/ true,
+                update_agent_status,
+            ))
+            .await;
         }
     }
 
@@ -2979,7 +2996,10 @@ impl Session {
 
     pub(crate) async fn send_event_raw(&self, event: Event) {
         // Keep event persistence out of callers' stack frames.
-        Box::pin(self.send_event_raw_with_persistence(event, /*persist*/ true)).await;
+        Box::pin(self.send_event_raw_with_persistence(
+            event, /*persist*/ true, /*update_agent_status*/ true,
+        ))
+        .await;
     }
 
     /// Delivers an event without creating a local rollout for a thread that has not materialized.
@@ -2992,10 +3012,16 @@ impl Session {
                 true
             }
         };
-        self.send_event_raw_with_persistence(event, persist).await;
+        self.send_event_raw_with_persistence(event, persist, /*update_agent_status*/ true)
+            .await;
     }
 
-    async fn send_event_raw_with_persistence(&self, event: Event, persist: bool) {
+    async fn send_event_raw_with_persistence(
+        &self,
+        event: Event,
+        persist: bool,
+        update_agent_status: bool,
+    ) {
         let flush_guardian_completion = persist
             && matches!(event.msg, EventMsg::TurnComplete(_))
             && self.is_private_guardian_reviewer().await;
@@ -3043,10 +3069,15 @@ impl Session {
         if flush_guardian_completion && let Err(err) = self.flush_rollout().await {
             warn!("failed to flush completed Guardian review: {err}");
         }
-        self.deliver_event_raw(event).await;
+        self.deliver_event(event, update_agent_status).await;
     }
 
     pub(crate) async fn deliver_event_raw(&self, event: Event) {
+        self.deliver_event(event, /*update_agent_status*/ true)
+            .await;
+    }
+
+    async fn deliver_event(&self, event: Event, update_agent_status: bool) {
         if let Some(parent_tx) = self.parent_observer_event_tx.get() {
             let forwarded = match &event.msg {
                 EventMsg::RawResponseItem(item) => {
@@ -3072,7 +3103,7 @@ impl Session {
             }
         }
         // Record the last known agent status.
-        if let Some(status) = agent_status_from_event(&event.msg) {
+        if update_agent_status && let Some(status) = agent_status_from_event(&event.msg) {
             self.agent_status.send_replace(status);
         }
         if let Err(e) = self.tx_event.send(event).await {

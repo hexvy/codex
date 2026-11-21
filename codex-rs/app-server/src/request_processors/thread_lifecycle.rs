@@ -33,6 +33,7 @@ pub(super) struct ListenerTaskContext {
 
 struct UnloadingState {
     delay: Duration,
+    deferred_until: Option<Instant>,
     has_subscribers_rx: watch::Receiver<bool>,
     has_subscribers: (bool, Instant),
     thread_status_rx: watch::Receiver<ThreadStatus>,
@@ -52,6 +53,7 @@ impl UnloadingState {
         );
         Self {
             delay,
+            deferred_until: None,
             has_subscribers_rx,
             has_subscribers,
             thread_status_rx,
@@ -62,7 +64,12 @@ impl UnloadingState {
     fn unloading_target(&self) -> Option<Instant> {
         match (self.has_subscribers, self.is_active) {
             ((false, has_no_subscribers_since), (false, is_inactive_since)) => {
-                std::cmp::max(has_no_subscribers_since, is_inactive_since).checked_add(self.delay)
+                let target = std::cmp::max(has_no_subscribers_since, is_inactive_since)
+                    .checked_add(self.delay)?;
+                Some(
+                    self.deferred_until
+                        .map_or(target, |until| target.max(until)),
+                )
             }
             _ => None,
         }
@@ -78,6 +85,9 @@ impl UnloadingState {
         if self.is_active.0 != is_active {
             self.is_active = (is_active, Instant::now());
         }
+        if has_subscribers || is_active {
+            self.deferred_until = None;
+        }
     }
 
     fn should_unload_now(&mut self) -> bool {
@@ -90,6 +100,10 @@ impl UnloadingState {
         if !self.is_active.0 {
             self.is_active = (false, Instant::now());
         }
+    }
+
+    fn defer_until(&mut self, until: Instant) {
+        self.deferred_until = Some(self.deferred_until.map_or(until, |old| old.max(until)));
     }
 
     async fn wait_for_unloading_trigger(&mut self) -> bool {
@@ -614,6 +628,16 @@ async fn start_listener(
                         break false;
                     };
                     if !unloading_state.should_unload_now() {
+                        continue;
+                    }
+                    if conversation.has_active_turn().await {
+                        unloading_state.defer_until(Instant::now() + Duration::from_secs(1));
+                        continue;
+                    }
+                    if let Some(until) = conversation.idle_compaction_retain_until()
+                        && until > Instant::now()
+                    {
+                        unloading_state.defer_until(until.min(Instant::now() + Duration::from_secs(60)));
                         continue;
                     }
                     if matches!(conversation.agent_status().await, AgentStatus::Running) {

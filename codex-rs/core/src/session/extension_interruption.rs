@@ -1,6 +1,7 @@
 //! Applies extension-requested interruption only if the selected turn is still active.
 //! Conditional interruption preserves queued input and acknowledges before joining the task.
 
+use super::idle_compaction::WorkerIdleCompaction;
 use super::session::Session;
 use crate::codex_thread::CodexThread;
 use codex_extension_api::ThreadIdleCause;
@@ -66,11 +67,11 @@ impl Session {
     ) {
         let active_turn = {
             let mut active = self.active_turn.lock().await;
-            let Some(turn) = active.as_ref().filter(|turn| {
-                turn.task
-                    .as_ref()
-                    .is_some_and(|task| task.turn_context.sub_id == turn_id)
-            }) else {
+            let Some((turn, task)) = active
+                .as_ref()
+                .and_then(|turn| turn.task.as_ref().map(|task| (turn, task)))
+                .filter(|(_, task)| task.turn_context.sub_id == turn_id)
+            else {
                 let _ = reply.send(false);
                 return;
             };
@@ -81,7 +82,14 @@ impl Session {
                 let _ = reply.send(false);
                 return;
             }
-            self.mark_interrupted();
+            if task
+                .turn_context
+                .extension_data
+                .get::<WorkerIdleCompaction>()
+                .is_none()
+            {
+                self.mark_interrupted();
+            }
             active.take()
         };
         // The caller may be inside the task that cancellation must join.

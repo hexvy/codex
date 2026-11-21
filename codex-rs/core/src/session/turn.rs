@@ -924,8 +924,8 @@ pub(crate) async fn run_turn(
                         let foreground_due = token_status.turn_end_compaction_threshold_reached;
                         let candidate =
                             super::async_compaction::take_ready(&sess, &turn_context).await;
-                        if (foreground_due || candidate.is_some())
-                            && let Err(err) = run_auto_compact(
+                        if foreground_due || candidate.is_some() {
+                            match run_auto_compact(
                                 &sess,
                                 Arc::clone(&step_context),
                                 Arc::clone(&step_context),
@@ -935,28 +935,36 @@ pub(crate) async fn run_turn(
                                 candidate,
                             )
                             .await
-                        {
-                            if matches!(err.details(), CodexErrorDetails::Interrupted)
-                                || crate::tasks::ends_turn_as_interrupted(&err)
                             {
-                                // The answer preceded this optional compaction. Deliver it while
-                                // the interrupt state keeps follow-ups in the next turn.
-                                if SamplingInterrupt::is_requested_for(&sess, &turn_context).await {
-                                    return Ok(last_agent_message);
+                                Ok(true) => {
+                                    turn_context
+                                        .extension_data
+                                        .insert(super::idle_compaction::PostTurnCompacted);
                                 }
-                                return Err(err);
+                                Ok(false) => {}
+                                Err(err) => {
+                                    if matches!(err.details(), CodexErrorDetails::Interrupted)
+                                        || crate::tasks::ends_turn_as_interrupted(&err)
+                                    {
+                                        if SamplingInterrupt::is_requested_for(&sess, &turn_context)
+                                            .await
+                                        {
+                                            return Ok(last_agent_message);
+                                        }
+                                        return Err(err);
+                                    }
+                                    let error = err.to_codex_protocol_error();
+                                    if error.is_usage_limit() {
+                                        sess.emit_turn_error_lifecycle(
+                                            turn_context.as_ref(),
+                                            error,
+                                            err.details(),
+                                        )
+                                        .await;
+                                    }
+                                    warn!(error = %err, "Post-turn compaction failed; preserving the completed turn");
+                                }
                             }
-                            let error = err.to_codex_protocol_error();
-                            if error.is_usage_limit() {
-                                // Preserve the completed answer while stopping automatic work.
-                                sess.emit_turn_error_lifecycle(
-                                    turn_context.as_ref(),
-                                    error,
-                                    err.details(),
-                                )
-                                .await;
-                            }
-                            warn!(error = %err, "Post-turn compaction failed; preserving the completed turn");
                         }
                     }
                     if work.should_finish_after_compaction()? {

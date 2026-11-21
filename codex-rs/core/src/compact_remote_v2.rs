@@ -153,10 +153,19 @@ pub(crate) async fn run_remote_compact_task(
     sess: Arc<Session>,
     step_context: Arc<StepContext>,
     world_state: Arc<WorldState>,
+    idle: bool,
 ) -> CodexResult<()> {
     let compaction_metadata = CompactionTurnMetadata::new(
-        CompactionTrigger::Manual,
-        CompactionReason::UserRequested,
+        if idle {
+            CompactionTrigger::Auto
+        } else {
+            CompactionTrigger::Manual
+        },
+        if idle {
+            CompactionReason::Idle
+        } else {
+            CompactionReason::UserRequested
+        },
         CompactionImplementation::ResponsesCompactionV2,
         CompactionPhase::StandaloneTurn,
     );

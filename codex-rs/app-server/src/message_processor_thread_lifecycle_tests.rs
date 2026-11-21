@@ -43,6 +43,129 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
+#[test]
+fn unsubscribed_thread_stays_loaded_until_idle_compaction() -> Result<()> {
+    super::message_processor_tracing_tests::run_current_thread_test_with_stack(
+        "unsubscribed_thread_stays_loaded_until_idle_compaction",
+        async {
+            let (server, _completions) = start_streaming_sse_server(vec![
+                vec![StreamingSseChunk {
+                    gate: None,
+                    body: responses::sse(vec![
+                        responses::ev_assistant_message("answer", "done"),
+                        responses::ev_completed("answer-response"),
+                    ]),
+                }],
+                vec![StreamingSseChunk {
+                    gate: None,
+                    body: responses::sse(vec![
+                        responses::ev_assistant_message("summary", "summary"),
+                        responses::ev_completed("compact-response"),
+                    ]),
+                }],
+            ])
+            .await;
+            let home = TempDir::new()?;
+            MockResponsesConfig::new(server.uri())
+                .with_root_config("thread_unload_delay_secs = 0")
+                .with_extra_config(
+                    r#"[features.idle_compact]
+enabled = true
+delay_seconds = 4
+retry_seconds = 1
+cache_window_seconds = 12
+"#,
+                )
+                .write(home.path())?;
+            let config = Arc::new(
+                ConfigBuilder::default()
+                    .codex_home(home.path().to_path_buf())
+                    .build()
+                    .await?,
+            );
+            let auth = AuthManager::shared_from_config(
+                config.as_ref(),
+                /*enable_codex_api_key_env*/ false,
+            )
+            .await?;
+            let (processor, mut outgoing) = build_test_processor(config, auth).await;
+            let owner_id = ConnectionId(1);
+            let owner = Arc::new(ConnectionSessionState::new(ConnectionOrigin::WebSocket));
+            let result: Result<()> = async {
+                send_request(
+                    &processor,
+                    owner_id,
+                    &owner,
+                    json!({"id": 1, "method": "initialize", "params": {
+                        "clientInfo": {"name": "idle-owner", "version": "1"},
+                        "capabilities": {"experimentalApi": true}
+                    }}),
+                )
+                .await;
+                let _: InitializeResponse =
+                    read_response_from(&mut outgoing, owner_id, /*request_id*/ 1).await;
+                processor
+                    .connection_initialized(owner_id, owner.request_attestation())
+                    .await;
+                send_request(
+                    &processor,
+                    owner_id,
+                    &owner,
+                    json!({"id": 2, "method": "thread/start", "params": {}}),
+                )
+                .await;
+                let started: ThreadStartResponse =
+                    read_response_from(&mut outgoing, owner_id, /*request_id*/ 2).await;
+                let thread_id = codex_protocol::ThreadId::from_string(&started.thread.id)?;
+                let thread = processor
+                    .thread_processor
+                    .thread_manager
+                    .get_thread(thread_id)
+                    .await?;
+                send_request(
+                    &processor,
+                    owner_id,
+                    &owner,
+                    json!({"id": 3, "method": "turn/start", "params": {
+                        "threadId": started.thread.id,
+                        "input": [{"type": "text", "text": "remember this"}]
+                    }}),
+                )
+                .await;
+                let _: TurnStartResponse =
+                    read_response_from(&mut outgoing, owner_id, /*request_id*/ 3).await;
+                timeout(Duration::from_secs(10), async {
+                    while thread.idle_compaction_retain_until().is_none() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await?;
+                processor.connection_closed(owner_id, &owner).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                assert!(
+                    processor
+                        .thread_processor
+                        .thread_manager
+                        .get_thread(thread_id)
+                        .await
+                        .is_ok()
+                );
+                timeout(
+                    Duration::from_secs(15),
+                    server.wait_for_request_count(/*count*/ 2),
+                )
+                .await?;
+                Ok(())
+            }
+            .await;
+            processor.clear_runtime_references();
+            processor.shutdown_threads().await;
+            server.shutdown().await;
+            result
+        },
+    )
+}
+
 #[tokio::test]
 async fn thread_start_unloads_after_requesting_connection_closes_during_mcp_startup() -> Result<()>
 {

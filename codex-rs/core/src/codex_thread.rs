@@ -532,6 +532,11 @@ impl CodexThread {
         self.session.emit_thread_idle_lifecycle_if_idle(cause).await;
     }
 
+    /// Keep an unsubscribed runtime alive until its pending idle compaction expires.
+    pub fn idle_compaction_retain_until(&self) -> Option<std::time::Instant> {
+        self.session.idle_compaction_retain_until()
+    }
+
     /// Checkpoint initialization without activating speculative persistence.
     pub async fn checkpoint_preparation(&self) -> std::io::Result<()> {
         self.session

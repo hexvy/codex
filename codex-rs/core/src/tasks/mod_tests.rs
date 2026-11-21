@@ -5,6 +5,7 @@ use super::emit_compact_metric;
 use super::emit_turn_memory_metric;
 use super::emit_turn_network_proxy_metric;
 use crate::session::TurnInput;
+use crate::session::idle_compaction::IdleCompactionStart;
 use crate::session::session::Session;
 use crate::session::tests::make_session_and_context_with_rx;
 use crate::session::turn_context::TurnContext;
@@ -106,7 +107,11 @@ async fn task_finish_rejects_uploaded_audio_without_losing_other_pending_input()
         .await;
 
     session
-        .on_task_finished(Arc::clone(&turn_context), /*task_result*/ Ok(None))
+        .on_task_finished(
+            Arc::clone(&turn_context),
+            /*task_result*/ Ok(None),
+            IdleCompactionStart::now(),
+        )
         .await;
 
     let history = session.clone_history().await;
@@ -348,7 +353,9 @@ async fn turn_completion_metrics_follow_model_switch(scenario: UsageScenario) {
         Ok(None)
     };
     let expected_root = turn_context.root_turn_id();
-    session.on_task_finished(turn_context, task_result).await;
+    session
+        .on_task_finished(turn_context, task_result, IdleCompactionStart::now())
+        .await;
     let mut terminal_root = None;
     while let Ok(event) = receiver.try_recv() {
         match event.msg {

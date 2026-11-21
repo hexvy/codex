@@ -885,8 +885,8 @@ impl ConfigEditsBuilder {
     ///
     /// Disabling a default-false feature clears the key instead of
     /// persisting `false`, so the config does not pin the feature once it
-    /// graduates to globally enabled. Structured multi-agent v2 settings are
-    /// an exception: its explicit `enabled = false` preserves nested options.
+    /// graduates to globally enabled. Structured multi-agent v2 settings are an
+    /// exception: `enabled = false` preserves their nested options.
     pub fn set_feature_enabled(mut self, key: &str, enabled: bool) -> Self {
         let mut segments = vec!["features".to_string(), key.to_string()];
         if key == "multi_agent_v2" && !enabled {

@@ -1087,6 +1087,94 @@ async fn rejects_non_regular_turns() {
     }
 }
 
+#[tokio::test]
+async fn user_input_replaces_idle_compaction() {
+    let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
+    session
+        .spawn_task(
+            turn_context,
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::IdleCompact,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+    let result = handle(
+        &session,
+        TurnInputRequest::user_input(vec![ResolvedUserInput::text("continue working".into())]),
+        TurnInputMode::StartOrSteer,
+        "user-turn".into(),
+    )
+    .await
+    .expect("user input should be accepted");
+    assert!(
+        matches!(result, TurnInputSubmission::Started { ref turn_id, .. } if turn_id == "user-turn")
+    );
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
+async fn steer_against_idle_compaction_requests_a_new_turn() {
+    let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
+    let idle_turn_id = turn_context.sub_id.clone();
+    session
+        .spawn_task(
+            turn_context,
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::IdleCompact,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+    let input = vec![ResolvedUserInput::text("continue".into())];
+    let mismatch = submit_steer_only(&session, input.clone(), "not-the-active-turn").await;
+    assert!(matches!(
+        mismatch,
+        TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::ExpectedTurnMismatch { .. }
+        }
+    ));
+    let result = submit_steer_only(&session, input, &idle_turn_id).await;
+    assert_eq!(
+        result,
+        TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::NoActiveTurn
+        }
+    );
+    assert!(session.active_turn.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn idle_compaction_does_not_consume_agent_mail() {
+    let (session, turn, _rx) = make_session_and_context_with_rx().await;
+    let mail = InterAgentCommunication::new(
+        AgentPath::root().join("worker").expect("worker path"),
+        AgentPath::root(),
+        Vec::new(),
+        "pending work".to_string(),
+        /*trigger_turn*/ true,
+    );
+    session
+        .input_queue
+        .enqueue_mailbox_communication(mail.clone().into(), Default::default())
+        .await;
+    session
+        .spawn_task(
+            turn,
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::IdleCompact,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+    assert!(session.input_queue.has_pending_mailbox_items().await);
+    session.abort_all_tasks(TurnAbortReason::Replaced).await;
+    assert!(session.input_queue.has_pending_mailbox_items().await);
+}
+
 #[test_case("automation_heartbeat_scheduled", None, UserInputOrigin::User; "human")]
 #[test_case("composer", Some("automation_heartbeat_scheduled"), UserInputOrigin::Heartbeat; "scheduled")]
 #[tokio::test]

@@ -273,6 +273,155 @@ async fn load_config_resolves_thread_unload_delay() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn idle_compaction_configuration_defaults_and_validation() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let load = |contents: &str| toml::from_str::<ConfigToml>(contents);
+    let defaults = Config::load_from_base_config_with_overrides(
+        load("")?,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+    assert!(defaults.features.enabled(Feature::IdleCompact));
+    let openai = codex_model_provider_info::ModelProviderInfo::create_openai_provider(
+        /*base_url*/ None,
+    );
+    let modern = defaults
+        .idle_compaction
+        .for_model("openai", &openai, "gpt-6.2-astra")
+        .expect("known model policy");
+    assert_eq!(modern.delay, Duration::from_secs(1500));
+    assert_eq!(modern.retry, Duration::from_secs(150));
+    assert_eq!(modern.cache_window, Duration::from_secs(1800));
+    let older = defaults
+        .idle_compaction
+        .for_model("openai", &openai, "gpt-5.4")
+        .expect("older model policy");
+    assert_eq!(older.delay, Duration::from_secs(250));
+    assert_eq!(older.cache_window, Duration::from_secs(300));
+    for (provider_id, model) in [("openai", "unknown"), ("custom", "gpt-5.4")] {
+        let fallback = defaults
+            .idle_compaction
+            .for_model(provider_id, &openai, model)
+            .expect("fallback policy");
+        assert_eq!(fallback.delay, Duration::from_secs(1500));
+        assert_eq!(fallback.retry, Duration::from_secs(150));
+        assert_eq!(fallback.cache_window, Duration::from_secs(1800));
+    }
+    let disabled = Config::load_from_base_config_with_overrides(
+        load("[features]\nidle_compact = false")?,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+    assert!(!disabled.features.enabled(Feature::IdleCompact));
+    let timing_only = Config::load_from_base_config_with_overrides(
+        load("[features.idle_compact]\ncache_window_seconds = 60")?,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+    assert!(timing_only.features.enabled(Feature::IdleCompact));
+
+    let configured = Config::load_from_base_config_with_overrides(
+        load(
+            r#"[features.idle_compact]
+enabled = true
+retry_seconds = 3
+cache_window_seconds = 120
+[features.idle_compact.providers.custom]
+cache_window_seconds = 60
+[features.idle_compact.providers.custom.models.example]
+delay_seconds = 10
+cache_window_seconds = 30
+"#,
+        )?,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+    assert!(configured.features.enabled(Feature::IdleCompact));
+    let model = configured
+        .idle_compaction
+        .for_model("custom", &openai, "example")
+        .expect("model override");
+    assert_eq!(model.delay, Duration::from_secs(10));
+    assert_eq!(model.retry, Duration::from_secs(3));
+    assert_eq!(model.cache_window, Duration::from_secs(30));
+    let provider = configured
+        .idle_compaction
+        .for_model("custom", &openai, "another-model")
+        .expect("provider override");
+    assert_eq!(provider.delay, Duration::from_secs(50));
+    assert_eq!(provider.cache_window, Duration::from_secs(60));
+    let global = configured
+        .idle_compaction
+        .for_model("another-provider", &openai, "unknown")
+        .expect("explicit global override");
+    assert_eq!(global.delay, Duration::from_secs(100));
+    assert_eq!(global.cache_window, Duration::from_secs(120));
+    for contents in [
+        "[features.idle_compact]\ndelay_seconds = 10\ncache_window_seconds = 10",
+        "[features.idle_compact]\nretry_seconds = 0",
+        "[features.idle_compact]\ncache_window_seconds = 0",
+        "[features.idle_compact]\ncache_window_seconds = 9223372036854775807",
+        "[features.idle_compact]\ndelay_seconds = 20\n[features.idle_compact.providers.custom]\ncache_window_seconds = 10",
+    ] {
+        assert!(
+            Config::load_from_base_config_with_overrides(
+                load(contents)?,
+                ConfigOverrides::default(),
+                codex_home.abs(),
+            )
+            .await
+            .is_err(),
+            "invalid configuration: {contents}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn idle_compact_honors_managed_feature_requirements() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        "[features.idle_compact]\ncache_window_seconds = 60\n",
+    )?;
+    let mut config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .cloud_config_bundle(
+            CloudConfigBundleFixture::loader_with_enterprise_requirement(
+                "[features]\nidle_compact = false\n",
+            ),
+        )
+        .build()
+        .await?;
+    assert!(!config.features.enabled(Feature::IdleCompact));
+    config
+        .features
+        .enable(Feature::IdleCompact)
+        .expect("managed feature mutation");
+    assert!(!config.features.enabled(Feature::IdleCompact));
+
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        "[features.idle_compact]\nenabled = true\n",
+    )?;
+    let explicitly_enabled = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .cloud_config_bundle(
+            CloudConfigBundleFixture::loader_with_enterprise_requirement(
+                "[features]\nidle_compact = false\n",
+            ),
+        )
+        .build()
+        .await?;
+    assert!(!explicitly_enabled.features.enabled(Feature::IdleCompact));
+    Ok(())
+}
+
+#[tokio::test]
 async fn load_config_rejects_thread_unload_delay_overflow() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
     let error = Config::load_from_base_config_with_overrides(

@@ -421,6 +421,9 @@ enum TurnContextBuildMode {
     /// shared model/multi-agent metadata.
     StartupPrewarm,
 
+    /// Executes maintenance without publishing its model as the thread's selection.
+    IdleCompaction,
+
     /// Captures recording settings without updating shared model/multi-agent metadata
     /// or discovering skills. Must not initialize context or capture an execution step.
     InjectItems,
@@ -1367,12 +1370,12 @@ impl Session {
                     .insert_arc(Arc::clone(&model_info.model));
                 self.resolve_multi_agent_version_for_model(&model_info, &per_turn_config)
             }
-            TurnContextBuildMode::StartupPrewarm | TurnContextBuildMode::InjectItems => {
-                per_turn_config.multi_agent_version_for_model(
-                    self.multi_agent_version()
-                        .or(model_info.multi_agent_version),
-                )
-            }
+            TurnContextBuildMode::StartupPrewarm
+            | TurnContextBuildMode::IdleCompaction
+            | TurnContextBuildMode::InjectItems => per_turn_config.multi_agent_version_for_model(
+                self.multi_agent_version()
+                    .or(model_info.multi_agent_version),
+            ),
         };
         let plugins_input = per_turn_config.plugins_config_input();
         let plugin_outcome = self
@@ -1599,6 +1602,24 @@ impl Session {
             .await;
         self.new_turn_from_configuration(sub_id, session_configuration, turn_environments, options)
             .await
+    }
+
+    pub(super) async fn new_idle_compaction_turn(
+        &self,
+        session_configuration: SessionConfiguration,
+    ) -> Arc<TurnContext> {
+        let turn_environments = self
+            .activate_turn_environments(&session_configuration)
+            .await;
+        Box::pin(self.new_turn_context_from_configuration(
+            super::new_submission_id(),
+            session_configuration,
+            turn_environments,
+            NewTurnContextOptions::default(),
+            TurnContextBuildMode::IdleCompaction,
+            self.git_enrichment_policy,
+        ))
+        .await
     }
 
     pub(crate) async fn new_startup_prewarm_turn_with_sub_id(

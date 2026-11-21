@@ -10,6 +10,7 @@ use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
 use codex_models_manager::bundled_models_response;
+use codex_protocol::AgentPath;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
@@ -26,14 +27,18 @@ use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AdditionalContextEntry;
 use codex_protocol::protocol::AdditionalContextKind;
+use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HookEventName;
 use codex_protocol::protocol::HookRunStatus;
+use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse;
@@ -103,6 +108,141 @@ const GLOBAL_AGENTS_OVERRIDE_FILENAME: &str = "AGENTS.override.md";
 const NEW_GLOBAL_INSTRUCTIONS: &str = "new global instructions";
 const OLD_GLOBAL_INSTRUCTIONS: &str = "old global instructions";
 const REMOTE_V2_SUMMARY: &str = "global-instructions-remote-v2-summary";
+
+#[test_case::test_case(false, false; "local")]
+#[test_case::test_case(true, false; "remote_v2")]
+#[test_case::test_case(false, true; "worker_with_passive_mail_and_new_model_selection")]
+fn idle_compaction_runs_once_after_a_completed_turn(remote_v2: bool, worker: bool) -> Result<()> {
+    core_test_support::test_codex::run_test_with_large_stack(
+        "idle_compaction_runs_once_after_a_completed_turn",
+        move || async move {
+            skip_if_no_network!(Ok(()));
+            let server = start_mock_server().await;
+            let request_log = mount_sse_sequence(
+                &server,
+                vec![
+                    sse(vec![
+                        ev_assistant_message("answer", FIRST_REPLY),
+                        ev_completed("answer-response"),
+                    ]),
+                    if remote_v2 {
+                        remote_v2_compaction_response()
+                    } else {
+                        sse(vec![
+                            ev_assistant_message("summary", SUMMARY_TEXT),
+                            ev_completed("compact-response"),
+                        ])
+                    },
+                ],
+            )
+            .await;
+            let provider = if remote_v2 {
+                openai_model_provider(&server)
+            } else {
+                non_openai_model_provider(&server)
+            };
+            let mut builder = test_codex();
+            if remote_v2 {
+                builder = builder.with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+            }
+            let mut builder = builder.with_config(move |config| {
+                config.model_provider = provider;
+                config
+                    .features
+                    .enable(Feature::IdleCompact)
+                    .expect("enable idle compaction");
+                config.idle_compaction.defaults.delay = Some(if worker {
+                    std::time::Duration::from_secs(2)
+                } else {
+                    std::time::Duration::from_millis(10)
+                });
+                config.idle_compaction.defaults.retry = Some(std::time::Duration::from_secs(1));
+                config.idle_compaction.defaults.cache_window =
+                    Some(std::time::Duration::from_secs(10));
+                set_test_compact_prompt(config);
+            });
+            let test = Box::pin(builder.build(&server)).await?;
+            let worker_path = AgentPath::root().join("worker").expect("valid worker path");
+            let codex = if worker {
+                let mut options = test.start_thread_options().await;
+                options.session_source =
+                    Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                        parent_thread_id: test.session_configured.thread_id,
+                        depth: 1,
+                        agent_path: Some(worker_path.clone()),
+                        agent_nickname: None,
+                        agent_role: None,
+                    }));
+                Box::pin(test.thread_manager.start_thread(options))
+                    .await?
+                    .thread
+            } else {
+                test.codex.clone()
+            };
+            Box::pin(codex.start_or_steer_turn(TurnInputRequest::user_input(vec![
+                UserInput::Text {
+                    text: "remember this".into(),
+                    text_elements: Vec::new(),
+                },
+            ])))
+            .await?;
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+                if worker {
+                    codex
+                        .submit(Op::InterAgentCommunication {
+                            communication: InterAgentCommunication::new(
+                                AgentPath::root(),
+                                worker_path,
+                                Vec::new(),
+                                "A report for the next model turn".into(),
+                                /*trigger_turn*/ false,
+                            ),
+                            start_options: Default::default(),
+                        })
+                        .await?;
+                    codex
+                        .update_thread_settings(ThreadSettingsOverrides {
+                            model: Some("gpt-5.2".into()),
+                            ..Default::default()
+                        })
+                        .await?;
+                }
+                wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+                Ok::<(), codex_protocol::error::CodexErr>(())
+            })
+            .await??;
+            let requests = request_log.requests();
+            assert_eq!(requests.len(), 2);
+            if worker {
+                assert_eq!(
+                    requests[1].body_json()["model"],
+                    requests[0].body_json()["model"]
+                );
+                assert_eq!(codex.selected_model_info().await.slug, "gpt-5.2");
+                assert_eq!(
+                    codex.agent_status().await,
+                    AgentStatus::Completed(Some(FIRST_REPLY.into()))
+                );
+            }
+            if remote_v2 {
+                assert_eq!(requests[1].inputs_of_type("compaction_trigger").len(), 1);
+            } else {
+                assert!(body_contains_text(
+                    &requests[1].body_json().to_string(),
+                    SUMMARIZATION_PROMPT
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert_eq!(
+                request_log.requests().len(),
+                2,
+                "compaction must not re-arm itself"
+            );
+            Ok(())
+        },
+    )
+}
 
 fn ev_exec_command_call(call_id: &str, command: &str) -> serde_json::Value {
     ev_function_call(

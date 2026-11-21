@@ -32,6 +32,9 @@ pub use feature_configs::GuardianV2TranscriptSource;
 pub use feature_configs::GuardianV3ConfigToml;
 pub use feature_configs::GuardianV3HousekeeperConfigToml;
 pub use feature_configs::GuardianV3ReviewerConfigToml;
+pub use feature_configs::IdleCompactConfigToml;
+pub use feature_configs::IdleCompactPolicyToml;
+pub use feature_configs::IdleCompactProviderToml;
 pub use feature_configs::MultiAgentV2ConfigToml;
 pub use feature_configs::NetworkProxyConfigToml;
 pub use feature_configs::NetworkProxyDomainPermissionToml;
@@ -526,8 +529,13 @@ pub enum Feature {
     RemoteCompactionV2,
     /// Prepare remote compaction in the background before the foreground limit is reached.
     AsyncCompaction,
+
     /// Restrict background compaction to the root session.
     AsyncCompactionRootOnly,
+
+    /// Compact an idle conversation or spawned worker before its estimated prompt-cache window ends.
+    IdleCompact,
+
     /// Include retained images in the remote compaction context budget.
     CompactionImageBudget,
     /// Retain client-authored developer messages across compacted context windows.
@@ -1011,6 +1019,8 @@ pub struct FeaturesToml {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub async_compaction: Option<FeatureToml<AsyncCompactionConfigToml>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_compact: Option<FeatureToml<IdleCompactConfigToml>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_management: Option<FeatureToml<ContextManagementConfigToml>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollout_budget: Option<FeatureToml<RolloutBudgetConfigToml>>,
@@ -1045,6 +1055,9 @@ impl FeaturesToml {
             .and_then(FeatureToml::enabled)
         {
             entries.insert(Feature::AsyncCompaction.key().to_string(), enabled);
+        }
+        if let Some(enabled) = self.idle_compact.as_ref().and_then(FeatureToml::enabled) {
+            entries.insert(Feature::IdleCompact.key().to_string(), enabled);
         }
         if let Some(enabled) = self.code_mode.as_ref().and_then(FeatureToml::enabled) {
             entries.insert(Feature::CodeMode.key().to_string(), enabled);
@@ -2505,6 +2518,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "async_compaction_root_only",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::IdleCompact,
+        key: "idle_compact",
+        stage: Stage::Stable,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::CompactionImageBudget,

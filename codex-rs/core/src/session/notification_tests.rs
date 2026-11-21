@@ -48,7 +48,11 @@ async fn task_finish_preserves_notification_budget_and_queued_user_input() {
 
     // Stall recording the first batch, then inject while finalization is in progress.
     let state = session.state.lock().await;
-    let finish = session.on_task_finished(Arc::clone(&turn), /*task_result*/ Ok(None));
+    let finish = session.on_task_finished(
+        Arc::clone(&turn),
+        /*task_result*/ Ok(None),
+        idle_compaction::IdleCompactionStart::now(),
+    );
     let late = vec![notification("late notification".to_string())];
     tokio::join!(finish, async {
         while session

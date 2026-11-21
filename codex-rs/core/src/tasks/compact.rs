@@ -13,11 +13,23 @@ use codex_user_input::ResolvedUserInput;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Default)]
-pub(crate) struct CompactTask;
+pub(crate) struct CompactTask {
+    idle: bool,
+}
+
+impl CompactTask {
+    pub(crate) fn idle() -> Self {
+        Self { idle: true }
+    }
+}
 
 impl SessionTask for CompactTask {
     fn kind(&self) -> TaskKind {
-        TaskKind::Compact
+        if self.idle {
+            TaskKind::IdleCompact
+        } else {
+            TaskKind::Compact
+        }
     }
 
     fn span_name(&self) -> &'static str {
@@ -50,7 +62,9 @@ impl SessionTask for CompactTask {
                 .await?,
         );
         if ctx.config.features.enabled(Feature::TokenBudget) {
-            // Preparing the context may wait; this reset never sends a model request.
+            if self.idle {
+                return Ok(None);
+            }
             session.check_rollout_budget()?;
             crate::compact_token_budget::run_manual_compact_task(
                 session,
@@ -66,12 +80,13 @@ impl SessionTask for CompactTask {
                 emit_compact_metric(
                     &session.services.session_telemetry,
                     "remote_v2",
-                    /*manual*/ true,
+                    /*manual*/ !self.idle,
                 );
                 crate::compact_remote_v2::run_remote_compact_task(
                     session.clone(),
                     step_context,
                     world_state,
+                    self.idle,
                 )
                 .await
             }
@@ -79,7 +94,7 @@ impl SessionTask for CompactTask {
                 emit_compact_metric(
                     &session.services.session_telemetry,
                     "local",
-                    /*manual*/ true,
+                    /*manual*/ !self.idle,
                 );
                 let input = vec![ResolvedUserInput::text(
                     ctx.config
@@ -88,8 +103,14 @@ impl SessionTask for CompactTask {
                         .unwrap_or(crate::compact::SUMMARIZATION_PROMPT)
                         .to_string(),
                 )];
-                crate::compact::run_compact_task(session.clone(), step_context, world_state, input)
-                    .await
+                crate::compact::run_compact_task(
+                    session.clone(),
+                    step_context,
+                    world_state,
+                    input,
+                    self.idle,
+                )
+                .await
             }
         };
         if let Err(err) = result {

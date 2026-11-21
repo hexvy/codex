@@ -203,6 +203,42 @@ fn code_mode_host_feature_config_preserves_boolean_toggle() {
 }
 
 #[test]
+fn idle_compact_supports_boolean_and_configured_feature_forms() {
+    assert!(Features::with_defaults().enabled(Feature::IdleCompact));
+    for (input, expected) in [
+        ("idle_compact = true", true),
+        ("idle_compact = false", false),
+        ("[idle_compact]\ncache_window_seconds = 60", true),
+        ("[idle_compact]\nenabled = true", true),
+        ("[idle_compact]\nenabled = false", false),
+    ] {
+        let config: FeaturesToml = toml::from_str(input).expect("idle-compaction feature");
+        let mut features = Features::with_defaults();
+        features.apply_toml(&config);
+        assert_eq!(features.enabled(Feature::IdleCompact), expected, "{input}");
+    }
+    assert_eq!(feature_for_key("idle_compact"), Some(Feature::IdleCompact));
+    assert_eq!(Feature::IdleCompact.stage(), Stage::Stable);
+    assert!(toml::from_str::<FeaturesToml>("[idle_compact]\nunknown = true").is_err());
+
+    let base: FeaturesToml = toml::from_str("idle_compact = true").expect("base feature");
+    let profile: FeaturesToml =
+        toml::from_str("[idle_compact]\ncache_window_seconds = 60").expect("profile options");
+    let features = Features::from_sources(
+        FeatureConfigSource {
+            features: Some(&base),
+            ..Default::default()
+        },
+        FeatureConfigSource {
+            features: Some(&profile),
+            ..Default::default()
+        },
+        FeatureOverrides::default(),
+    );
+    assert!(features.enabled(Feature::IdleCompact));
+}
+
+#[test]
 fn guardian_v2_feature_config_preserves_boolean_toggle() {
     let features: FeaturesToml =
         toml::from_str("guardianv2 = true").expect("Guardian v2 boolean should deserialize");

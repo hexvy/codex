@@ -708,6 +708,45 @@ other non-default provider fields are not supported"
             .unwrap_or(provider_id == OPENAI_PROVIDER_ID)
     }
 
+    /// Conservative scheduling estimate, not a guarantee that a prefix is cached.
+    /// Unknown providers and model families require an explicit policy.
+    pub fn estimated_prompt_cache_window(
+        &self,
+        provider_id: &str,
+        model: &str,
+    ) -> Option<std::time::Duration> {
+        if provider_id != OPENAI_PROVIDER_ID
+            || self
+                .base_url
+                .as_deref()
+                .is_some_and(|url| !codex_http_client::is_openai_api_url(url))
+        {
+            return None;
+        }
+        let family = |prefix: &str| {
+            model
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('-'))
+        };
+        // https://developers.openai.com/api/docs/guides/prompt-caching#summary-of-model-differences
+        if ["gpt-6.2", "gpt-6.1", "gpt-6", "gpt-5.6", "gpt-5.5"]
+            .into_iter()
+            .any(family)
+        {
+            Some(std::time::Duration::from_secs(30 * 60))
+        } else if [
+            "gpt-5.4", "gpt-5.3", "gpt-5.2", "gpt-5.1", "gpt-5", "gpt-4.1",
+        ]
+        .into_iter()
+        .any(family)
+        {
+            // Older models may use in-memory retention, whose typical idle life is 5–10 min.
+            Some(std::time::Duration::from_secs(5 * 60))
+        } else {
+            None
+        }
+    }
+
     pub fn is_openai(&self) -> bool {
         self.name == OPENAI_PROVIDER_NAME
     }

@@ -72,6 +72,7 @@ pub fn is_structured_feature_path<S: AsRef<str>>(path: &[S]) -> bool {
             feature.as_ref(),
             "code_mode"
                 | "guardianv3"
+                | "idle_compact"
                 | "multi_agent_v2"
                 | "network_proxy"
                 | "sleep_tool"

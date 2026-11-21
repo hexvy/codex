@@ -81,6 +81,7 @@ use codex_features::FeatureToml;
 use codex_features::Features;
 use codex_features::FeaturesToml;
 use codex_features::GuardianV3ConfigToml;
+use codex_features::IdleCompactConfigToml;
 use codex_features::MultiAgentV2ConfigToml;
 use codex_features::NetworkProxyConfigToml;
 use codex_features::RuntimeAuthMode;
@@ -682,6 +683,9 @@ pub struct Config {
     /// Zero disables turn-end compaction.
     pub model_post_turn_compact_threshold_percent: u8,
 
+    /// Opt-in policy for compacting an idle root thread while its cache may be warm.
+    pub idle_compaction: IdleCompactionConfig,
+
     /// Percentage of the model's full context window at which background compaction starts.
     pub async_compaction_threshold_percent: u8,
 
@@ -1252,6 +1256,167 @@ pub struct Config {
 
     /// OTEL configuration (exporter type, endpoint, headers, etc.).
     pub otel: codex_config::types::OtelConfig,
+}
+
+/// Optional scheduling overrides, resolved against the active provider and model.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IdleCompactionOverrides {
+    pub delay: Option<Duration>,
+    pub retry: Option<Duration>,
+    pub cache_window: Option<Duration>,
+}
+
+impl IdleCompactionOverrides {
+    fn overlay(&self, higher: &Self) -> Self {
+        Self {
+            delay: higher.delay.or(self.delay),
+            retry: higher.retry.or(self.retry),
+            cache_window: higher.cache_window.or(self.cache_window),
+        }
+    }
+
+    fn validate(&self, label: &str) -> std::io::Result<()> {
+        if self.retry.is_some_and(|retry| retry.is_zero())
+            || self.cache_window.is_some_and(|window| window.is_zero())
+            || self
+                .delay
+                .zip(self.cache_window)
+                .is_some_and(|(delay, window)| delay >= window)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{label}: delay must be shorter than the cache window; retry and cache window must be positive"
+                ),
+            ));
+        }
+        for duration in [self.delay, self.retry, self.cache_window]
+            .into_iter()
+            .flatten()
+        {
+            if std::time::Instant::now().checked_add(duration).is_none()
+                || std::time::SystemTime::now().checked_add(duration).is_none()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{label}: duration is too large"),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IdleCompactionProviderConfig {
+    pub defaults: IdleCompactionOverrides,
+    pub models: BTreeMap<String, IdleCompactionOverrides>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IdleCompactionConfig {
+    pub defaults: IdleCompactionOverrides,
+    pub providers: BTreeMap<String, IdleCompactionProviderConfig>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IdleCompactionTiming {
+    pub delay: Duration,
+    pub retry: Duration,
+    pub cache_window: Duration,
+}
+
+impl IdleCompactionConfig {
+    pub fn for_model(
+        &self,
+        provider_id: &str,
+        provider: &ModelProviderInfo,
+        model: &str,
+    ) -> Option<IdleCompactionTiming> {
+        let mut overrides = self.defaults.clone();
+        if let Some(provider) = self.providers.get(provider_id) {
+            overrides = overrides.overlay(&provider.defaults);
+            if let Some(model) = provider.models.get(model) {
+                overrides = overrides.overlay(model);
+            }
+        }
+        let cache_window = overrides
+            .cache_window
+            .or_else(|| provider.estimated_prompt_cache_window(provider_id, model))
+            // Unknown policies still get a best-effort attempt, not a claim about
+            // the provider's actual cache retention.
+            .unwrap_or(Duration::from_secs(30 * 60));
+        let delay = overrides
+            .delay
+            .unwrap_or_else(|| cache_window.saturating_sub(cache_window / 6));
+        if delay >= cache_window {
+            return None;
+        }
+        let retry = overrides
+            .retry
+            .unwrap_or_else(|| ((cache_window - delay) / 2).max(Duration::from_secs(1)));
+        if retry.is_zero() {
+            return None;
+        }
+        Some(IdleCompactionTiming {
+            delay,
+            retry,
+            cache_window,
+        })
+    }
+}
+
+fn resolve_idle_compaction_config(
+    raw: Option<&IdleCompactConfigToml>,
+) -> std::io::Result<IdleCompactionConfig> {
+    let Some(raw) = raw else {
+        return Ok(IdleCompactionConfig::default());
+    };
+    let overrides =
+        |delay: Option<u64>, retry: Option<u64>, window: Option<u64>| IdleCompactionOverrides {
+            delay: delay.map(Duration::from_secs),
+            retry: retry.map(Duration::from_secs),
+            cache_window: window.map(Duration::from_secs),
+        };
+    let defaults = overrides(
+        raw.delay_seconds,
+        raw.retry_seconds,
+        raw.cache_window_seconds,
+    );
+    defaults.validate("features.idle_compact")?;
+    let mut providers = BTreeMap::new();
+    for (provider_id, provider) in &raw.providers {
+        let provider_defaults = overrides(
+            provider.delay_seconds,
+            provider.retry_seconds,
+            provider.cache_window_seconds,
+        );
+        let combined = defaults.overlay(&provider_defaults);
+        combined.validate(&format!("features.idle_compact.providers.{provider_id}"))?;
+        let mut models = BTreeMap::new();
+        for (model, policy) in &provider.models {
+            let policy = overrides(
+                policy.delay_seconds,
+                policy.retry_seconds,
+                policy.cache_window_seconds,
+            );
+            combined.overlay(&policy).validate(&format!(
+                "features.idle_compact.providers.{provider_id}.models.{model}"
+            ))?;
+            models.insert(model.clone(), policy);
+        }
+        providers.insert(
+            provider_id.clone(),
+            IdleCompactionProviderConfig {
+                defaults: provider_defaults,
+                models,
+            },
+        );
+    }
+    Ok(IdleCompactionConfig {
+        defaults,
+        providers,
+    })
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -3512,6 +3677,14 @@ impl Config {
                 "model_post_turn_compact_threshold_percent must be between 0 and 100",
             ));
         }
+        let idle_compaction = resolve_idle_compaction_config(
+            cfg.features.as_ref()
+                .and_then(|features| features.idle_compact.as_ref())
+                .and_then(|feature| match feature {
+                    FeatureToml::Enabled(_) => None,
+                    FeatureToml::Config(config) => Some(config),
+                }),
+        )?;
         let async_compaction_threshold_percent = cfg.features.as_ref()
             .and_then(|features| features.async_compaction.as_ref())
             .and_then(|feature| match feature {
@@ -4747,6 +4920,7 @@ impl Config {
             model_post_turn_compact_threshold_percent: cfg
                 .model_post_turn_compact_threshold_percent
                 .unwrap_or_default(),
+            idle_compaction,
             async_compaction_threshold_percent,
             model_provider_id,
             model_provider,
