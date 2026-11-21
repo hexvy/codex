@@ -136,6 +136,12 @@ pub(super) async fn try_submit_user_turn(
             if !matches!(&admission, UserMessageAdmission::Queued(_)) {
                 crate::startup_recovery::acknowledged(client_user_message_id);
             }
+            if original_active.is_some()
+                && matches!(&admission, UserMessageAdmission::StartResponse(_))
+            {
+                app.chat_widget
+                    .promote_pending_steer_to_started_turn(client_user_message_id);
+            }
             if ordinary || !matches!(&admission, UserMessageAdmission::Steered(_)) {
                 app.chat_widget
                     .user_message_admitted(admission, op, client_user_message_id);
@@ -230,6 +236,7 @@ fn turn_start_settings<'a>(
         }),
         explicit_profile.and_then(RuntimePermissionProfileOverride::turn_permission_profile),
     );
+
     TurnStartSettings {
         approval_policy: turn_approval_policy,
         approvals_reviewer: turn_approvals_reviewer,

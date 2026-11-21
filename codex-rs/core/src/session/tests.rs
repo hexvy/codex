@@ -7092,6 +7092,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         conversation: Arc::new(RealtimeConversationManager::new()),
         realtime_history: None,
         active_turn: Mutex::new(None),
+        idle_compaction: watch::channel(None).0,
         async_hook_results,
         input_queue: super::input_queue::InputQueue::new(),
         services,
@@ -7153,6 +7154,384 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     session.mark_mcp_runtime_dirty(McpRefreshReason::ExplicitInvalidation);
     crate::guardian::test_host::install(&session, &turn_context.config);
     (session, turn_context)
+}
+
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "mirror the finishing-turn admission lock while preparing a schedule"
+)]
+async fn prepare_idle_compaction_for_test(
+    session: &Session,
+    turn: &TurnContext,
+    cause: codex_extension_api::ThreadIdleCause,
+) -> Option<super::idle_compaction::IdleCompactionSchedule> {
+    let _active = session.active_turn.lock().await;
+    session
+        .prepare_idle_compaction(
+            turn,
+            cause,
+            /*last_model*/ None,
+            super::idle_compaction::IdleCompactionStart::now(),
+        )
+        .await
+}
+
+fn enable_idle_compaction_for_test(
+    turn: &mut TurnContext,
+) -> &mut crate::config::IdleCompactionOverrides {
+    let config = Arc::make_mut(&mut turn.config);
+    config
+        .features
+        .enable(Feature::IdleCompact)
+        .expect("enable idle compaction");
+    let policy = &mut config.idle_compaction.defaults;
+    policy.cache_window = Some(StdDuration::from_secs(1800));
+    policy
+}
+
+#[tokio::test]
+async fn idle_compaction_rejects_interrupted_and_subagent_turns() {
+    let (session, mut turn) = make_session_and_context().await;
+    let policy = enable_idle_compaction_for_test(&mut turn);
+    policy.delay = Some(StdDuration::ZERO);
+    session.state.lock().await.last_started_turn_id = Some(turn.sub_id.clone());
+
+    assert!(
+        prepare_idle_compaction_for_test(
+            &session,
+            &turn,
+            codex_extension_api::ThreadIdleCause::Interrupted,
+        )
+        .await
+        .is_none()
+    );
+    assert!(session.idle_compaction.borrow().is_none());
+    turn.session_source = SessionSource::SubAgent(SubAgentSource::Review);
+    assert!(
+        prepare_idle_compaction_for_test(
+            &session,
+            &turn,
+            codex_extension_api::ThreadIdleCause::Completed,
+        )
+        .await
+        .is_none()
+    );
+    assert!(session.idle_compaction.borrow().is_none());
+    turn.session_source = SessionSource::Cli;
+    let scheduled = prepare_idle_compaction_for_test(
+        &session,
+        &turn,
+        codex_extension_api::ThreadIdleCause::Failed,
+    )
+    .await
+    .expect("failed root turn should be scheduled");
+    assert!(session.idle_compaction_retain_until().is_some());
+    let session = Arc::new(session);
+    session.check_idle_compaction().await;
+    assert!(
+        session.active_turn.lock().await.is_none(),
+        "idle contributors must finish before dispatch"
+    );
+    session.arm_idle_compaction(&scheduled);
+}
+
+#[tokio::test]
+async fn idle_compaction_skips_a_turn_already_compacted_at_completion() {
+    let (session, mut turn) = make_session_and_context().await;
+    enable_idle_compaction_for_test(&mut turn);
+    session.state.lock().await.last_started_turn_id = Some(turn.sub_id.clone());
+    turn.extension_data
+        .insert(super::idle_compaction::PostTurnCompacted);
+    assert!(
+        prepare_idle_compaction_for_test(
+            &session,
+            &turn,
+            codex_extension_api::ThreadIdleCause::Completed,
+        )
+        .await
+        .is_none()
+    );
+    assert!(session.idle_compaction.borrow().is_none());
+}
+
+#[tokio::test]
+async fn idle_compaction_does_not_replace_newer_or_busy_work() {
+    let (session, mut turn) = make_session_and_context().await;
+    let policy = enable_idle_compaction_for_test(&mut turn);
+    policy.delay = Some(StdDuration::ZERO);
+    policy.retry = Some(StdDuration::from_secs(10));
+    let session = Arc::new(session);
+    session.state.lock().await.last_started_turn_id = Some(turn.sub_id.clone());
+    let scheduled = prepare_idle_compaction_for_test(
+        &session,
+        &turn,
+        codex_extension_api::ThreadIdleCause::Completed,
+    )
+    .await
+    .expect("scheduled");
+    session.arm_idle_compaction(&scheduled);
+    session.state.lock().await.last_started_turn_id = Some("newer".into());
+    session.check_idle_compaction().await;
+    assert!(session.idle_compaction.borrow().is_none());
+    assert!(session.active_turn.lock().await.is_none());
+
+    session.state.lock().await.last_started_turn_id = Some(turn.sub_id.clone());
+    let scheduled = prepare_idle_compaction_for_test(
+        &session,
+        &turn,
+        codex_extension_api::ThreadIdleCause::Completed,
+    )
+    .await
+    .expect("scheduled");
+    session.arm_idle_compaction(&scheduled);
+    session.state.lock().await.history.replace(Vec::new());
+    session.check_idle_compaction().await;
+    assert!(
+        session.idle_compaction.borrow().is_none(),
+        "history changes invalidate the snapshot"
+    );
+
+    let scheduled = prepare_idle_compaction_for_test(
+        &session,
+        &turn,
+        codex_extension_api::ThreadIdleCause::Completed,
+    )
+    .await
+    .expect("scheduled");
+    session.arm_idle_compaction(&scheduled);
+    let previous = session.idle_compaction.borrow().clone();
+    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    session.check_idle_compaction().await;
+    assert_ne!(*session.idle_compaction.borrow(), previous);
+    assert!(session.active_turn.lock().await.is_some());
+}
+
+#[tokio::test]
+async fn idle_compaction_does_not_run_after_its_window() {
+    let (session, mut turn) = make_session_and_context().await;
+    let policy = enable_idle_compaction_for_test(&mut turn);
+    policy.delay = Some(StdDuration::ZERO);
+    policy.cache_window = Some(StdDuration::from_millis(10));
+    session.state.lock().await.last_started_turn_id = Some(turn.sub_id.clone());
+    let session = Arc::new(session);
+    let scheduled = prepare_idle_compaction_for_test(
+        &session,
+        &turn,
+        codex_extension_api::ThreadIdleCause::Completed,
+    )
+    .await
+    .expect("scheduled");
+    session.arm_idle_compaction(&scheduled);
+    tokio::time::sleep(StdDuration::from_millis(20)).await;
+    session.check_idle_compaction().await;
+    assert!(session.idle_compaction.borrow().is_none());
+    assert!(session.active_turn.lock().await.is_none());
+}
+
+#[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "mirror the finishing-turn admission lock while preparing the model-specific schedule"
+)]
+async fn idle_compaction_uses_last_model_policy_and_skips_a_model_change() {
+    let (session, mut turn) = make_session_and_context().await;
+    let config = Arc::make_mut(&mut turn.config);
+    config
+        .features
+        .enable(Feature::IdleCompact)
+        .expect("enable");
+    let mut provider = crate::config::IdleCompactionProviderConfig::default();
+    provider.models.insert(
+        "previous-model".to_string(),
+        crate::config::IdleCompactionOverrides {
+            delay: Some(StdDuration::ZERO),
+            cache_window: Some(StdDuration::from_secs(60)),
+            ..Default::default()
+        },
+    );
+    config
+        .idle_compaction
+        .providers
+        .insert(config.model_provider_id.clone(), provider);
+    session.state.lock().await.last_started_turn_id = Some(turn.sub_id.clone());
+    let session = Arc::new(session);
+    let schedule = {
+        let _active = session.active_turn.lock().await;
+        session
+            .prepare_idle_compaction(
+                &turn,
+                codex_extension_api::ThreadIdleCause::Completed,
+                /*last_model*/ Some("previous-model"),
+                super::idle_compaction::IdleCompactionStart::now(),
+            )
+            .await
+            .expect("last model has a configured policy")
+    };
+    session.arm_idle_compaction(&schedule);
+    session.check_idle_compaction().await;
+    assert!(session.idle_compaction.borrow().is_none());
+    assert!(session.active_turn.lock().await.is_none());
+}
+
+#[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "force the interrupt to race with publication of a finishing turn's schedule"
+)]
+async fn interrupt_cancels_idle_compaction_published_by_a_finishing_turn() {
+    let (session, mut turn) = make_session_and_context().await;
+    enable_idle_compaction_for_test(&mut turn);
+    session.state.lock().await.last_started_turn_id = Some(turn.sub_id.clone());
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let scheduled = prepare_idle_compaction_for_test(
+        &session,
+        &turn,
+        codex_extension_api::ThreadIdleCause::Completed,
+    )
+    .await
+    .expect("initial schedule");
+    session.arm_idle_compaction(&scheduled);
+
+    // Keep the finishing turn in prepare_idle_compaction after it takes the
+    // active-turn lock, while the interrupt is waiting to take the same lock.
+    let state = session.state.lock().await;
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+    let finishing_session = Arc::clone(&session);
+    let finishing_turn = Arc::clone(&turn);
+    let finishing = tokio::spawn(async move {
+        let mut active = finishing_session.active_turn.lock().await;
+        *active = Some(ActiveTurn::default());
+        let _ = locked_tx.send(());
+        let scheduled = finishing_session
+            .prepare_idle_compaction(
+                &finishing_turn,
+                codex_extension_api::ThreadIdleCause::Completed,
+                /*last_model*/ None,
+                super::idle_compaction::IdleCompactionStart::now(),
+            )
+            .await;
+        *active = None;
+        drop(active);
+        if let Some(scheduled) = scheduled {
+            finishing_session.arm_idle_compaction(&scheduled);
+        }
+    });
+    locked_rx.await.expect("finishing turn acquired the lock");
+    let interrupt_session = Arc::clone(&session);
+    let (interrupt_tx, interrupt_rx) = tokio::sync::oneshot::channel();
+    let interrupt = tokio::spawn(async move {
+        let _ = interrupt_tx.send(());
+        let active = interrupt_session.active_turn.lock().await;
+        interrupt_session.interrupt_task(active).await;
+    });
+    interrupt_rx.await.expect("interrupt started");
+    drop(state);
+
+    finishing.await.expect("finishing turn task");
+    interrupt.await.expect("interrupt task");
+    assert!(session.idle_compaction.borrow().is_none());
+}
+
+#[tokio::test]
+async fn idle_compaction_cannot_register_over_a_replacement_turn() {
+    #[derive(Default)]
+    struct StartBarrier {
+        block_next: std::sync::atomic::AtomicBool,
+        aborted: std::sync::atomic::AtomicBool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl codex_extension_api::TurnLifecycleContributor for StartBarrier {
+        fn on_turn_start<'a>(
+            &'a self,
+            _input: codex_extension_api::TurnStartInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(async move {
+                if self
+                    .block_next
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+            })
+        }
+
+        fn on_turn_abort<'a>(
+            &'a self,
+            input: codex_extension_api::TurnAbortInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(async move {
+                if input.reason == TurnAbortReason::Replaced {
+                    self.aborted
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            })
+        }
+    }
+
+    let (mut session, mut turn) = make_session_and_context().await;
+    let policy = enable_idle_compaction_for_test(&mut turn);
+    policy.delay = Some(StdDuration::ZERO);
+    session.state.lock().await.last_started_turn_id = Some(turn.sub_id.clone());
+    let barrier = Arc::new(StartBarrier::default());
+    barrier
+        .block_next
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    builder.turn_lifecycle_contributor(barrier.clone());
+    session.services.extensions = Arc::new(builder.build());
+    let session = Arc::new(session);
+    let schedule = prepare_idle_compaction_for_test(
+        &session,
+        &turn,
+        codex_extension_api::ThreadIdleCause::Completed,
+    )
+    .await
+    .expect("idle schedule");
+    session.arm_idle_compaction(&schedule);
+    let schedule = session.idle_compaction.borrow().clone().expect("armed");
+    let turn_state = {
+        let mut active = session.active_turn.lock().await;
+        Arc::clone(&active.get_or_insert_with(ActiveTurn::default).turn_state)
+    };
+    let idle_session = Arc::clone(&session);
+    let idle = tokio::spawn(async move {
+        idle_session
+            .start_reserved_idle_compaction(Arc::new(turn), &turn_state, &schedule)
+            .await
+    });
+    tokio::time::timeout(StdDuration::from_secs(5), barrier.entered.notified())
+        .await
+        .expect("idle task reached its lifecycle callback");
+
+    let replacement = session
+        .new_turn_with_default_settings("replacement-turn".to_string(), Default::default())
+        .await;
+    session
+        .spawn_task(
+            replacement,
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+    barrier.release.notify_one();
+    assert!(!idle.await.expect("idle admission task"));
+    assert!(barrier.aborted.load(std::sync::atomic::Ordering::SeqCst));
+    {
+        let active = session.active_turn.lock().await;
+        let task = active.as_ref().and_then(|turn| turn.task.as_ref());
+        assert!(task.is_some_and(|task| {
+            task.kind == TaskKind::Regular && task.turn_context.sub_id == "replacement-turn"
+        }));
+    }
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
 
 async fn make_session_with_config(
@@ -9449,6 +9828,7 @@ where
         conversation: Arc::new(RealtimeConversationManager::new()),
         realtime_history: None,
         active_turn: Mutex::new(None),
+        idle_compaction: watch::channel(None).0,
         async_hook_results,
         input_queue: super::input_queue::InputQueue::new(),
         services,

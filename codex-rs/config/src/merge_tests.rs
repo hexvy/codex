@@ -201,6 +201,40 @@ fn merge_multi_agent_v2_boolean_preserves_existing_feature_table() {
     }
 }
 
+#[test]
+fn idle_compact_layers_and_cli_toggles_preserve_policy() {
+    for feature_path in ["features", "profiles.work.features"] {
+        let mut base = parse_toml(&format!("[{feature_path}]\nidle_compact = true\n"));
+        let policy = parse_toml(&format!(
+            "[{feature_path}.idle_compact.providers.custom]\ncache_window_seconds = 60\n"
+        ));
+        merge_toml_values(&mut base, &policy);
+        let expected = |enabled| {
+            parse_toml(&format!(
+                "[{feature_path}.idle_compact]\nenabled = {enabled}\n[{feature_path}.idle_compact.providers.custom]\ncache_window_seconds = 60\n"
+            ))
+        };
+        assert_eq!(base, expected(true));
+        merge_toml_values(
+            &mut base,
+            &parse_toml(&format!("[{feature_path}]\nidle_compact = false\n")),
+        );
+        assert_eq!(base, expected(false));
+
+        let enabled = (
+            format!("{feature_path}.idle_compact"),
+            TomlValue::Boolean(true),
+        );
+        let window = (
+            format!("{feature_path}.idle_compact.providers.custom.cache_window_seconds"),
+            TomlValue::Integer(60),
+        );
+        for overrides in [vec![enabled.clone(), window.clone()], vec![window, enabled]] {
+            assert_eq!(crate::build_cli_overrides_layer(&overrides), expected(true));
+        }
+    }
+}
+
 /// Opaque desktop settings retain ordinary scalar/table replacement semantics.
 #[test]
 fn merge_multi_agent_v2_compatibility_excludes_opaque_desktop_paths() {

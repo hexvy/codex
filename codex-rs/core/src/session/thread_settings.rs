@@ -91,6 +91,7 @@ pub(super) async fn update(
         .is_none_or(|active_turn| active_turn.task.is_none())
     {
         session.state.lock().await.last_started_turn_id = None;
+        session.cancel_idle_compaction();
     }
     Ok(commit)
 }

@@ -42,6 +42,9 @@ impl RegularTask {
 }
 
 impl SessionTask for RegularTask {
+    fn schedules_idle_compaction(&self) -> bool {
+        true
+    }
     fn kind(&self) -> TaskKind {
         TaskKind::Regular
     }
@@ -71,7 +74,7 @@ impl SessionTask for RegularTask {
         }
         // Regular turns emit `TurnStarted` inline so first-turn lifecycle does
         // not wait on startup prewarm resolution.
-        let prewarmed_client_session = async {
+        let prewarmed_client_session = Box::pin(async {
             sess.emit_turn_started(&ctx, TaskKind::Regular).await;
             sess.start_deferred_mcp_reprojection();
             // Regular-start contributors run once, after the task is visible and interruptible.
@@ -88,18 +91,18 @@ impl SessionTask for RegularTask {
             }
             sess.consume_startup_prewarm_for_regular_turn(&cancellation_token)
                 .await
-        }
+        })
         .instrument(trace_span!("regular_task.prepare_run_turn"))
         .await;
         let prewarmed_client_session = match prewarmed_client_session {
             SessionStartupPrewarmResolution::Cancelled => {
-                let _ = run_hooks_and_record_inputs(
+                let _ = Box::pin(run_hooks_and_record_inputs(
                     &sess,
                     &ctx,
                     &ctx.capture_current_model_info(),
                     &input,
                     PersistContext::Standard,
-                )
+                ))
                 .await;
                 return Ok(None);
             }

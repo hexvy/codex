@@ -113,6 +113,8 @@ pub(crate) struct Session {
     pub(crate) conversation: Arc<RealtimeConversationManager>,
     pub(crate) realtime_history: Option<Mutex<crate::realtime_history::RealtimeHistoryState>>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
+    pub(super) idle_compaction:
+        watch::Sender<Option<super::idle_compaction::IdleCompactionSchedule>>,
     pub(crate) async_hook_results: async_channel::Receiver<HookCompletedEvent>,
     pub(crate) input_queue: InputQueue,
     pub(crate) services: SessionServices,
@@ -2043,6 +2045,7 @@ impl Session {
                     && services.live_thread.is_some())
                 .then(|| Mutex::new(crate::realtime_history::RealtimeHistoryState::default())),
                 active_turn: Mutex::new(None),
+                idle_compaction: watch::channel(None).0,
                 async_hook_results,
                 input_queue: InputQueue::with_controller(
                     thread_id,

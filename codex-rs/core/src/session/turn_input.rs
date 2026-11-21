@@ -44,6 +44,7 @@ use codex_protocol::protocol::NonSteerableTurnKind;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSettingsOverrides;
+use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::turn_input::AnnotatedResponseItem;
 use codex_protocol::turn_input::NotSubmittedReason;
 use codex_protocol::turn_input::ResponsesApiClientMetadataUpdate;
@@ -53,6 +54,7 @@ type TurnInputRequest = codex_protocol::turn_input::TurnInputRequest<ResolvedUse
 use codex_protocol::turn_input::TurnInputSubmission;
 use codex_protocol::turn_input::TurnStartOptions;
 use codex_user_input::ResolvedUserInput;
+use futures::future::BoxFuture;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -304,6 +306,7 @@ async fn handle_inner(
     {
         validate_injected_response_item(item)?;
     }
+
     // Native agent follow-ups do not use the request's additional context.
     if !(matches!(mode, TurnInputMode::StartOrSteer)
         && matches!(
@@ -318,9 +321,16 @@ async fn handle_inner(
             .try_for_each(AdditionalContextEntry::validate)
             .map_err(|message| CodexErr::InvalidRequest(message.to_owned()))?;
     }
+
     let result = match mode {
         TurnInputMode::StartOrSteer => {
-            start_or_steer(session, request, submission_id, realtime_handoff_id).await
+            Box::pin(start_or_steer(
+                session,
+                request,
+                submission_id,
+                realtime_handoff_id,
+            ))
+            .await
         }
         TurnInputMode::StartIfIdle => {
             let kind = match &request.request.input {
@@ -332,14 +342,14 @@ async fn handle_inner(
                 | SubmittedTurnInput::AnnotatedResponseItem(_)
                 | SubmittedTurnInput::InterAgentCommunication(_) => TurnStartKind::Automatic,
             };
-            start_if_idle(
+            Box::pin(start_if_idle(
                 session,
                 request,
                 submission_id,
                 kind,
                 /*expected_previous_turn_id*/ None,
                 realtime_handoff_id,
-            )
+            ))
             .await
         }
         TurnInputMode::ContinueIfIdle {
@@ -360,24 +370,24 @@ async fn handle_inner(
                     ));
                 }
             }
-            start_if_idle(
+            Box::pin(start_if_idle(
                 session,
                 request,
                 submission_id,
                 TurnStartKind::Recovery,
                 Some(expected_previous_turn_id),
                 realtime_handoff_id,
-            )
+            ))
             .await
         }
         TurnInputMode::Steer { expected_turn_id } => {
-            steer(
+            Box::pin(steer(
                 session,
                 request,
                 expected_turn_id,
                 submission_id,
                 realtime_handoff_id,
-            )
+            ))
             .await
         }
     };
@@ -506,6 +516,9 @@ pub(super) async fn start_or_steer(
     )
     .await?;
     let sender_messages = capture_sender_user_messages(session, &mut input).await;
+    if has_explicit_input && matches!(&input, SubmittedTurnInput::UserInput { .. }) {
+        interrupt_idle_compaction(session, /*expected*/ None).await;
+    }
     match session
         .steer_input(
             &mut input,
@@ -801,6 +814,15 @@ async fn steer(
         start,
     )
     .await?;
+    if matches!(&input, SubmittedTurnInput::UserInput { content, .. } if !content.is_empty())
+        && interrupt_idle_compaction(session, Some(&expected_turn_id)).await
+    {
+        // A steer cannot create a new turn. The TUI already retries a missing
+        // active turn as turn/start, preserving its complete start settings.
+        return Ok(TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::NoActiveTurn,
+        });
+    }
     match session
         .steer_input(
             &mut input,
@@ -822,6 +844,37 @@ async fn steer(
         }
         Err(reason) => Ok(TurnInputSubmission::NotSubmitted { reason }),
     }
+}
+
+pub(super) fn interrupt_idle_compaction<'a>(
+    session: &'a Arc<Session>,
+    expected: Option<&'a str>,
+) -> BoxFuture<'a, bool> {
+    Box::pin(async move {
+        let turn_id = {
+            let active = session.active_turn.lock().await;
+            active
+                .as_ref()
+                .and_then(|active| active.task.as_ref())
+                .and_then(|task| {
+                    (task.kind == crate::state::TaskKind::IdleCompact
+                        && expected
+                            .is_none_or(|expected| expected == task.turn_context.sub_id.as_str()))
+                    .then(|| task.turn_context.sub_id.clone())
+                })
+        };
+        match turn_id {
+            Some(turn_id) => {
+                Box::pin(session.abort_turn_if_active(
+                    &turn_id,
+                    TurnAbortReason::Replaced,
+                    /*error*/ None,
+                ))
+                .await
+            }
+            None => false,
+        }
+    })
 }
 
 impl Session {
@@ -975,7 +1028,10 @@ impl Session {
             && TurnStartKind::Automatic.permits_mode(config.step_settings.collaboration_mode.mode)
     }
 
-    async fn clear_reserved_idle_turn(&self, turn_state: &Arc<tokio::sync::Mutex<TurnState>>) {
+    pub(super) async fn clear_reserved_idle_turn(
+        &self,
+        turn_state: &Arc<tokio::sync::Mutex<TurnState>>,
+    ) {
         let mut active_turn_guard = self.active_turn.lock().await;
         if let Some(active_turn) = active_turn_guard.as_ref()
             && active_turn.task.is_none()
@@ -1051,7 +1107,7 @@ impl Session {
                     turn_kind: NonSteerableTurnKind::Review,
                 });
             }
-            crate::state::TaskKind::Compact => {
+            crate::state::TaskKind::Compact | crate::state::TaskKind::IdleCompact => {
                 return Err(NotSubmittedReason::ActiveTurnNotSteerable {
                     turn_kind: NonSteerableTurnKind::Compact,
                 });

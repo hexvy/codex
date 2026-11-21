@@ -158,6 +158,7 @@ pub(crate) async fn run_compact_task(
     step_context: Arc<StepContext>,
     world_state: Arc<WorldState>,
     input: Vec<ResolvedUserInput>,
+    idle: bool,
 ) -> CodexResult<()> {
     run_compact_task_inner(
         sess.clone(),
@@ -166,8 +167,16 @@ pub(crate) async fn run_compact_task(
         input,
         world_state,
         CompactionTurnMetadata::new(
-            CompactionTrigger::Manual,
-            CompactionReason::UserRequested,
+            if idle {
+                CompactionTrigger::Auto
+            } else {
+                CompactionTrigger::Manual
+            },
+            if idle {
+                CompactionReason::Idle
+            } else {
+                CompactionReason::UserRequested
+            },
             CompactionImplementation::Responses,
             CompactionPhase::StandaloneTurn,
         ),

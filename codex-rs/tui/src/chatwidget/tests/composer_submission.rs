@@ -3355,6 +3355,36 @@ async fn provider_error_recovers_only_the_rejected_steer() {
 }
 
 #[tokio::test]
+async fn accepted_steer_retried_as_start_is_not_restored_on_old_turn_interrupt() {
+    let (mut chat, mut events, _operations) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    handle_turn_started(&mut chat, "old-turn");
+    let mut pending = pending_steer("continue working");
+    pending.client_id = "retried-prompt".into();
+    chat.input_queue.pending_steers.push_back(pending);
+
+    chat.promote_pending_steer_to_started_turn("retried-prompt");
+    handle_turn_interrupted(&mut chat, "old-turn");
+    assert!(chat.input_queue.pending_steers.is_empty());
+    assert!(chat.bottom_pane.composer_is_empty());
+    chat.on_committed_user_message(
+        &[UserInput::Text {
+            text: "continue working".into(),
+            text_elements: Vec::new(),
+        }],
+        Some("retried-prompt"),
+        /*from_replay*/ false,
+        "new-turn",
+    );
+    let rendered = drain_insert_history(&mut events)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(rendered.matches("continue working").count(), 1);
+}
+
+#[tokio::test]
 async fn provider_error_recovers_the_rejected_initial_prompt() {
     let (mut chat, _events, mut operations) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());

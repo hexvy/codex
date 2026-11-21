@@ -104,6 +104,88 @@ const NEW_GLOBAL_INSTRUCTIONS: &str = "new global instructions";
 const OLD_GLOBAL_INSTRUCTIONS: &str = "old global instructions";
 const REMOTE_V2_SUMMARY: &str = "global-instructions-remote-v2-summary";
 
+#[test_case::test_case(false; "local")]
+#[test_case::test_case(true; "remote_v2")]
+fn idle_compaction_runs_once_after_a_completed_turn(remote_v2: bool) -> Result<()> {
+    core_test_support::test_codex::run_test_with_large_stack(
+        "idle_compaction_runs_once_after_a_completed_turn",
+        move || async move {
+            skip_if_no_network!(Ok(()));
+            let server = start_mock_server().await;
+            let request_log = mount_sse_sequence(
+                &server,
+                vec![
+                    sse(vec![
+                        ev_assistant_message("answer", FIRST_REPLY),
+                        ev_completed("answer-response"),
+                    ]),
+                    if remote_v2 {
+                        remote_v2_compaction_response()
+                    } else {
+                        sse(vec![
+                            ev_assistant_message("summary", SUMMARY_TEXT),
+                            ev_completed("compact-response"),
+                        ])
+                    },
+                ],
+            )
+            .await;
+            let provider = if remote_v2 {
+                openai_model_provider(&server)
+            } else {
+                non_openai_model_provider(&server)
+            };
+            let mut builder = test_codex();
+            if remote_v2 {
+                builder = builder.with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+            }
+            let mut builder = builder.with_config(move |config| {
+                config.model_provider = provider;
+                config
+                    .features
+                    .enable(Feature::IdleCompact)
+                    .expect("enable idle compaction");
+                config.idle_compaction.defaults.delay = Some(std::time::Duration::from_millis(10));
+                config.idle_compaction.defaults.retry = Some(std::time::Duration::from_secs(1));
+                config.idle_compaction.defaults.cache_window =
+                    Some(std::time::Duration::from_secs(10));
+                set_test_compact_prompt(config);
+            });
+            let test = Box::pin(builder.build(&server)).await?;
+            let codex = test.codex.clone();
+            Box::pin(codex.start_or_steer_turn(TurnInputRequest::user_input(vec![
+                UserInput::Text {
+                    text: "remember this".into(),
+                    text_elements: Vec::new(),
+                },
+            ])))
+            .await?;
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+                wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+            })
+            .await?;
+            let requests = request_log.requests();
+            assert_eq!(requests.len(), 2);
+            if remote_v2 {
+                assert_eq!(requests[1].inputs_of_type("compaction_trigger").len(), 1);
+            } else {
+                assert!(body_contains_text(
+                    &requests[1].body_json().to_string(),
+                    SUMMARIZATION_PROMPT
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert_eq!(
+                request_log.requests().len(),
+                2,
+                "compaction must not re-arm itself"
+            );
+            Ok(())
+        },
+    )
+}
+
 fn ev_exec_command_call(call_id: &str, command: &str) -> serde_json::Value {
     ev_function_call(
         call_id,

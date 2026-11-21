@@ -1109,3 +1109,36 @@ fn cyber_access_program_capability_uses_provider_identity_and_explicit_overrides
         }
     }
 }
+
+#[test]
+fn estimated_prompt_cache_window_uses_provider_and_model_identity() {
+    let provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
+    for (model, seconds) in [
+        ("gpt-6.2-astra", Some(1800)),
+        ("gpt-6.2-sol", Some(1800)),
+        ("gpt-6.1-sol", Some(1800)),
+        ("gpt-5.6-terra", Some(1800)),
+        ("gpt-5.5-pro", Some(1800)),
+        ("gpt-5.4", Some(300)),
+        ("gpt-5.1-codex-mini", Some(300)),
+        ("gpt-5.60-unknown", None),
+        ("unknown", None),
+    ] {
+        assert_eq!(
+            provider
+                .estimated_prompt_cache_window(OPENAI_PROVIDER_ID, model)
+                .map(|duration| duration.as_secs()),
+            seconds,
+            "{model}"
+        );
+    }
+    assert_eq!(
+        provider.estimated_prompt_cache_window("custom", "gpt-6.1-sol"),
+        None
+    );
+    let proxy = ModelProviderInfo::create_openai_provider(Some("https://example.com/v1".into()));
+    assert_eq!(
+        proxy.estimated_prompt_cache_window(OPENAI_PROVIDER_ID, "gpt-6.1-sol"),
+        None
+    );
+}

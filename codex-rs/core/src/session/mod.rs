@@ -1,3 +1,4 @@
+pub(crate) mod idle_compaction;
 pub(crate) mod startup;
 
 use crate::McpRefreshReason;

@@ -137,6 +137,32 @@ fn multi_agent_v2_feature_toggle_preserves_nested_configuration() {
 }
 
 #[test]
+fn idle_compact_toggle_preserves_provider_and_model_policy() {
+    let tmp = tempdir().expect("tmpdir");
+    let codex_home = tmp.path();
+    let config_path = codex_home.join(CONFIG_TOML_FILE);
+    let settings = |enabled| {
+        format!(
+            "[features.idle_compact]\nenabled = {enabled}\n[features.idle_compact.providers.custom.models.example]\ncache_window_seconds = 60\n"
+        )
+    };
+    std::fs::write(&config_path, settings(true)).expect("write config");
+    for enabled in [false, true] {
+        ConfigEditsBuilder::new(codex_home)
+            .set_feature_enabled("idle_compact", enabled)
+            .apply_blocking()
+            .expect("toggle feature");
+        let actual: TomlValue =
+            toml::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
+                .expect("parse config");
+        assert_eq!(
+            actual,
+            toml::from_str::<TomlValue>(&settings(enabled)).unwrap()
+        );
+    }
+}
+
+#[test]
 fn sleep_tool_feature_toggle_preserves_mode() {
     let tmp = tempdir().expect("tmpdir");
     let codex_home = tmp.path();

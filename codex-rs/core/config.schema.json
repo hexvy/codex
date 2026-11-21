@@ -1126,6 +1126,9 @@
             "hosted_search_policy": {
               "type": "boolean"
             },
+            "idle_compact": {
+              "$ref": "#/definitions/FeatureToml_for_IdleCompactConfigToml"
+            },
             "image_detail_original": {
               "type": "boolean"
             },
@@ -1939,6 +1942,16 @@
         },
         {
           "$ref": "#/definitions/GuardianV3ConfigToml"
+        }
+      ]
+    },
+    "FeatureToml_for_IdleCompactConfigToml": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/definitions/IdleCompactConfigToml"
         }
       ]
     },
@@ -2829,6 +2842,91 @@
             "$ref": "#/definitions/HookStateToml"
           },
           "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "IdleCompactConfigToml": {
+      "additionalProperties": false,
+      "description": "Optional timing overrides for idle compaction. A timing alone does not enable it.",
+      "properties": {
+        "cache_window_seconds": {
+          "description": "Estimated cache window in seconds; required when no provider/model policy is known.",
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "delay_seconds": {
+          "description": "Delay after a turn, in seconds. Defaults to five sixths of the cache window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "providers": {
+          "additionalProperties": {
+            "$ref": "#/definitions/IdleCompactProviderToml"
+          },
+          "description": "Overrides keyed by configured model-provider ID.",
+          "type": "object"
+        },
+        "retry_seconds": {
+          "description": "Retry interval in seconds. Defaults to half the time between the delay and deadline.",
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "IdleCompactPolicyToml": {
+      "additionalProperties": false,
+      "description": "Timing overrides for one model within a provider.",
+      "properties": {
+        "cache_window_seconds": {
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "delay_seconds": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "retry_seconds": {
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "IdleCompactProviderToml": {
+      "additionalProperties": false,
+      "description": "Timing overrides for one provider, optionally refined by model slug.",
+      "properties": {
+        "cache_window_seconds": {
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "delay_seconds": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "models": {
+          "additionalProperties": {
+            "$ref": "#/definitions/IdleCompactPolicyToml"
+          },
+          "type": "object"
+        },
+        "retry_seconds": {
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
         }
       },
       "type": "object"
@@ -8493,6 +8591,9 @@
         },
         "hosted_search_policy": {
           "type": "boolean"
+        },
+        "idle_compact": {
+          "$ref": "#/definitions/FeatureToml_for_IdleCompactConfigToml"
         },
         "image_detail_original": {
           "type": "boolean"

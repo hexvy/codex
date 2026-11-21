@@ -98,6 +98,7 @@ pub async fn inter_agent_communication(
         || sess.features.enabled(Feature::WakeOnAgentMessages)
         || sess.has_outstanding_durable_sleep()
     {
+        turn_input::interrupt_idle_compaction(sess, /*expected*/ None).await;
         sess.maybe_start_turn_for_pending_work_with_sub_id(sub_id)
             .await;
     }
@@ -109,6 +110,7 @@ pub async fn run_user_shell_command(
     command: String,
     timeout_ms: Option<u64>,
 ) {
+    turn_input::interrupt_idle_compaction(sess, /*expected*/ None).await;
     if let Some((turn_context, cancellation_token)) =
         sess.active_turn_context_and_cancellation_token().await
     {
@@ -277,7 +279,8 @@ pub async fn compact(sess: &Arc<Session>, sub_id: String) {
         .new_turn_with_default_settings(sub_id, Default::default())
         .await;
 
-    sess.spawn_task(turn_context, Vec::new(), CompactTask).await;
+    sess.spawn_task(turn_context, Vec::new(), CompactTask::default())
+        .await;
 }
 
 pub(super) async fn persist_thread_memory_mode_update(
@@ -325,6 +328,8 @@ pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>) {
         let mut state = sess.state.lock().await;
         // Stop admission and take the current warmup together so resume cannot replace it.
         state.shutting_down = true;
+        // Schedule publication holds this lock while checking shutting_down.
+        sess.cancel_idle_compaction();
         state.take_session_startup_prewarm()
     };
     if let Some(startup_prewarm) = startup_prewarm {
@@ -538,10 +543,12 @@ pub(super) async fn submission_loop(
         updates.mark_changed();
     }
     let mut mailbox = sess.input_queue.mailbox_updates();
+    let mut idle_compaction = sess.idle_compaction.subscribe();
     if let Some(updates) = &mut mailbox {
         updates.mark_changed();
     }
     loop {
+        let idle_schedule = idle_compaction.borrow().clone();
         let sub = tokio::select! {
             biased;
             _ = sess.services.local_agent_runtime.shutdown.cancelled() => {
@@ -587,6 +594,14 @@ pub(super) async fn submission_loop(
                 Ok(sub) => *sub,
                 Err(_) => break,
             },
+            _ = super::idle_compaction::wait_for_check(idle_schedule) => {
+                Box::pin(sess.check_idle_compaction()).await;
+                continue;
+            },
+            changed = idle_compaction.changed() => {
+                if changed.is_err() { break; }
+                continue;
+            },
             update = async {
                 match &mut mailbox {
                     Some(updates) => updates.changed().await.map(|()| *updates.borrow_and_update()),
@@ -599,6 +614,7 @@ pub(super) async fn submission_loop(
                         if sess.features.enabled(Feature::WakeOnAgentMessages)
                             || sess.has_outstanding_durable_sleep()
                         {
+                            turn_input::interrupt_idle_compaction(&sess, /*expected*/ None).await;
                             sess.maybe_start_turn_for_pending_work().await;
                         }
                     }

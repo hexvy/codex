@@ -44,6 +44,7 @@ pub(crate) fn record_model_fallback(
 ) {
     let reason_tag = match reason {
         CompactionReason::UserRequested => "user_requested",
+        CompactionReason::Idle => "idle",
         CompactionReason::ContextLimit => "context_limit",
         CompactionReason::ModelDownshift => "model_downshift",
         CompactionReason::CompHashChanged => "comp_hash_changed",

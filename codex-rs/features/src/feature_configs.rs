@@ -687,3 +687,61 @@ impl FeatureConfig for AsyncCompactionConfigToml {
         self.enabled
     }
 }
+
+/// Optional timing overrides for idle compaction. A timing alone does not enable it.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IdleCompactConfigToml {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Delay after a turn, in seconds. Defaults to five sixths of the cache window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delay_seconds: Option<u64>,
+    /// Retry interval in seconds. Defaults to half the time between the delay and deadline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub retry_seconds: Option<u64>,
+    /// Estimated cache window in seconds; required when no provider/model policy is known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub cache_window_seconds: Option<u64>,
+    /// Overrides keyed by configured model-provider ID.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, IdleCompactProviderToml>,
+}
+
+impl FeatureConfig for IdleCompactConfigToml {
+    fn enabled(&self) -> Option<bool> {
+        self.enabled
+    }
+}
+
+/// Timing overrides for one provider, optionally refined by model slug.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IdleCompactProviderToml {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delay_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub retry_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub cache_window_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, IdleCompactPolicyToml>,
+}
+
+/// Timing overrides for one model within a provider.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IdleCompactPolicyToml {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delay_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub retry_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub cache_window_seconds: Option<u64>,
+}

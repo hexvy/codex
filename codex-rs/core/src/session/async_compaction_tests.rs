@@ -196,6 +196,7 @@ async fn cancelled_turn_skips_launch_but_preserves_existing_work(trigger: Compac
                 Arc::clone(&sess),
                 next_step,
                 world_state,
+                /*idle*/ false,
             )
             .await
             .expect("manual compaction reuses the completed request");
