@@ -1227,6 +1227,7 @@ pub enum CollabAgentTool {
     SendMessage,
     FollowupTask,
     InterruptAgent,
+    CompactAgent,
     ListAgents,
 }
 
@@ -1334,6 +1335,7 @@ impl From<CoreCollabAgentTool> for CollabAgentTool {
             CoreCollabAgentTool::SendMessage => Self::SendMessage,
             CoreCollabAgentTool::FollowupTask => Self::FollowupTask,
             CoreCollabAgentTool::InterruptAgent => Self::InterruptAgent,
+            CoreCollabAgentTool::CompactAgent => Self::CompactAgent,
             CoreCollabAgentTool::ListAgents => Self::ListAgents,
         }
     }

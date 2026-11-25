@@ -160,6 +160,7 @@ type AgentControlFactory =
 // small subset of ops they inspect.
 fn capture_test_op(op: &Op) -> Option<Op> {
     match op {
+        Op::Compact => Some(Op::Compact),
         Op::Interrupt => Some(Op::Interrupt),
         Op::InterruptAgent => Some(Op::InterruptAgent),
         Op::InterAgentCommunication {

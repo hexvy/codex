@@ -221,7 +221,7 @@ impl LocalAgentControl {
         Ok(spawned_agent.thread_id)
     }
 
-    fn validate_loaded_v2_child(
+    pub(super) fn validate_loaded_v2_child(
         &self,
         thread: &CodexThread,
         parent_thread_id: ThreadId,
@@ -242,6 +242,35 @@ impl LocalAgentControl {
         )))
     }
 
+    pub(super) async fn validate_v2_parent(
+        &self,
+        parent: &Arc<CodexThread>,
+        child: ThreadId,
+    ) -> CodexResult<()> {
+        let parent_thread_id = parent.session.thread_id;
+        let registered_parent = self
+            .runtime
+            .upgrade()?
+            .get_thread(parent_thread_id)
+            .await
+            .ok();
+        if !registered_parent
+            .as_ref()
+            .is_some_and(|registered| Arc::ptr_eq(registered, parent))
+            || !parent.is_running()
+            || parent.multi_agent_version() != Some(MultiAgentVersion::V2)
+            || !Arc::ptr_eq(
+                &self.runtime.registry,
+                &parent.session.services.local_agent_runtime.registry,
+            )
+        {
+            return Err(CodexErr::InvalidRequest(format!(
+                "cannot resume multi-agent v2 child {child}: parent ownership is unavailable; resume the parent first"
+            )));
+        }
+        Ok(())
+    }
+
     /// A provided parent enables owner-validated reloads; `None` preserves sender-driven reloads.
     /// Keep the returned residency pin until the caller has submitted its input.
     pub(crate) async fn ensure_v2_agent_loaded(
@@ -254,22 +283,7 @@ impl LocalAgentControl {
         let state = self.runtime.upgrade()?;
         let owner_thread_id = parent.as_ref().map(|parent| parent.session.thread_id);
         if let Some(parent) = &parent {
-            let parent_thread_id = parent.session.thread_id;
-            let registered_parent = state.get_thread(parent_thread_id).await.ok();
-            if !registered_parent
-                .as_ref()
-                .is_some_and(|registered| Arc::ptr_eq(registered, parent))
-                || !parent.is_running()
-                || parent.multi_agent_version() != Some(MultiAgentVersion::V2)
-                || !Arc::ptr_eq(
-                    &self.runtime.registry,
-                    &parent.session.services.local_agent_runtime.registry,
-                )
-            {
-                return Err(CodexErr::InvalidRequest(format!(
-                    "cannot resume multi-agent v2 child {thread_id}: parent ownership is unavailable; resume the parent first"
-                )));
-            }
+            self.validate_v2_parent(parent, thread_id).await?;
         }
         if owner_thread_id.is_none()
             && let Ok(thread) = state.get_thread(thread_id).await

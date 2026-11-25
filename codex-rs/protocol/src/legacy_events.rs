@@ -291,6 +291,7 @@ impl CollabAgentToolCallItem {
             CollabAgentTool::SendMessage
             | CollabAgentTool::FollowupTask
             | CollabAgentTool::InterruptAgent
+            | CollabAgentTool::CompactAgent
             | CollabAgentTool::ListAgents => None,
             CollabAgentTool::SpawnAgent => Some(EventMsg::CollabAgentSpawnBegin(
                 CollabAgentSpawnBeginEvent {
@@ -350,6 +351,7 @@ impl CollabAgentToolCallItem {
             CollabAgentTool::SendMessage
             | CollabAgentTool::FollowupTask
             | CollabAgentTool::InterruptAgent
+            | CollabAgentTool::CompactAgent
             | CollabAgentTool::ListAgents => None,
             CollabAgentTool::SpawnAgent => {
                 let (new_agent_nickname, new_agent_role) = receiver_thread_id

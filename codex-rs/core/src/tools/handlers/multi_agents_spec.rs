@@ -358,6 +358,29 @@ pub fn create_close_agent_tool_v1() -> ToolSpec {
     })
 }
 
+pub fn create_compact_agent_tool_v2() -> ToolSpec {
+    let properties = BTreeMap::from([(
+        "target".to_string(),
+        JsonSchema::string(Some(
+            "Agent id or canonical task name of your immediate child to compact.".to_string(),
+        )),
+    )]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "compact_agent".to_string(),
+        description: "Interrupt your immediate child's current work and compact it immediately. Returns a submission ID once accepted, not when compaction finishes. If available, send_message can queue a message for the agent.".to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(properties, Some(vec!["target".to_string()]), Some(false.into())),
+        output_schema: Some(json!({
+            "type": "object",
+            "properties": { "submission_id": { "type": "string" } },
+            "required": ["submission_id"],
+            "additionalProperties": false
+        }).into()),
+    })
+}
+
 pub fn create_interrupt_agent_tool_v2() -> ToolSpec {
     let properties = BTreeMap::from([(
         "target".to_string(),

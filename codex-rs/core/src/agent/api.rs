@@ -87,6 +87,9 @@ pub trait AgentControl: Send + Sync {
     /// authority. Success makes the child available for attachment through its thread manager.
     fn ensure_child_loaded(&self, parent: ThreadId, child: ThreadId) -> BoxFuture<'_, Result<()>>;
 
+    /// Request compaction of a direct child, returning the accepted submission ID.
+    fn compact(&self, owner: ThreadId, child: ThreadId) -> BoxFuture<'_, Result<String>>;
+
     /// Stop current work and return the pre-interrupt snapshot. V2 rejects root/self
     /// targets and tolerates known unloaded agents; other modes retain direct-ID interruption.
     fn interrupt(

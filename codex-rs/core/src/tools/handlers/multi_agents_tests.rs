@@ -22,6 +22,7 @@ use crate::session::tests::update_turn_settings_for_test;
 use crate::session::turn_context::TurnContext;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::tools::context::ToolOutput;
+use crate::tools::handlers::multi_agents_v2::CompactAgentHandler;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
 use crate::tools::handlers::multi_agents_v2::InterruptAgentHandler;
 use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
@@ -129,6 +130,84 @@ fn function_payload(args: serde_json::Value) -> ToolPayload {
 
 fn parse_agent_id(id: &str) -> ThreadId {
     ThreadId::from_string(id).expect("agent id should be valid")
+}
+
+async fn start_multi_agent_v2_root() -> (
+    ThreadManager,
+    Arc<crate::session::session::Session>,
+    Arc<TurnContext>,
+) {
+    let (_, turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    config.agent_max_depth = 2;
+
+    let manager = thread_manager();
+    let (session, turn) = start_multi_agent_v2_thread(&manager, config).await;
+
+    (manager, session, turn)
+}
+
+async fn start_multi_agent_v2_thread(
+    manager: &ThreadManager,
+    config: crate::config::Config,
+) -> (Arc<crate::session::session::Session>, Arc<TurnContext>) {
+    let root = manager
+        .start_thread(StartThreadOptions::new(config))
+        .await
+        .expect("root thread should start");
+    let session = manager
+        .get_thread(root.thread_id)
+        .await
+        .expect("root thread should exist")
+        .session
+        .clone();
+    let turn = session.new_default_turn().await;
+
+    (session, turn)
+}
+
+async fn spawn_multi_agent_v2_child(
+    session: Arc<crate::session::session::Session>,
+    turn: Arc<TurnContext>,
+    task_name: &str,
+) -> ThreadId {
+    SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "test child",
+                "task_name": task_name,
+                "fork_turns": "none",
+            })),
+        ))
+        .await
+        .expect("spawn_agent should succeed");
+
+    session
+        .services
+        .agent_control
+        .resolve(
+            session.thread_id,
+            turn.parent_thread_id,
+            &turn.session_source,
+            task_name,
+        )
+        .await
+        .expect("spawned child path should resolve")
+}
+
+fn compacted_thread_ids(manager: &ThreadManager) -> Vec<ThreadId> {
+    manager
+        .captured_ops()
+        .into_iter()
+        .filter_map(|(thread_id, op)| matches!(op, Op::Compact { .. }).then_some(thread_id))
+        .collect()
 }
 
 async fn wait_for_recorded_user_input(thread: &crate::CodexThread, expected: &[UserInput]) {
@@ -3837,6 +3916,186 @@ async fn multi_agent_v2_wait_agent_does_not_return_completed_content() {
     );
     assert!(!content.contains("sensitive child output"));
     assert_eq!(success, None);
+}
+
+#[tokio::test]
+async fn multi_agent_v2_compact_agent_accepts_direct_child_and_returns_submission_id() {
+    let (manager, session, turn) = start_multi_agent_v2_root().await;
+    let worker_id = spawn_multi_agent_v2_child(session.clone(), turn.clone(), "worker").await;
+    let sibling_id = spawn_multi_agent_v2_child(session.clone(), turn.clone(), "sibling").await;
+    let compactions_before = compacted_thread_ids(&manager);
+
+    let output = CompactAgentHandler
+        .handle(invocation(
+            session,
+            turn,
+            "compact_agent",
+            function_payload(json!({"target": "worker"})),
+        ))
+        .await
+        .expect("compact_agent should accept a direct child target");
+    let (content, success) = expect_text_output(output);
+    let result: serde_json::Value =
+        serde_json::from_str(&content).expect("compact_agent result should be json");
+    let submission_id = result
+        .get("submission_id")
+        .and_then(serde_json::Value::as_str)
+        .expect("accepted compaction should include a submission id");
+
+    assert!(!submission_id.is_empty());
+    assert_eq!(success, Some(true));
+    let compactions_after = compacted_thread_ids(&manager);
+    assert_eq!(compactions_after.len(), compactions_before.len() + 1);
+    assert_eq!(compactions_after.last(), Some(&worker_id));
+    assert!(!compactions_after[compactions_before.len()..].contains(&sibling_id));
+}
+
+#[tokio::test]
+async fn multi_agent_v2_compact_agent_allows_nested_owner_to_compact_direct_child() {
+    let (manager, session, turn) = start_multi_agent_v2_root().await;
+    let worker_id = spawn_multi_agent_v2_child(session.clone(), turn.clone(), "worker").await;
+    let worker = manager
+        .get_thread(worker_id)
+        .await
+        .expect("worker thread should exist");
+    let worker_session = worker.session.clone();
+    let worker_turn = worker_session.new_default_turn().await;
+    let child_id =
+        spawn_multi_agent_v2_child(worker_session.clone(), worker_turn.clone(), "child").await;
+    let compactions_before = compacted_thread_ids(&manager);
+
+    let output = CompactAgentHandler
+        .handle(invocation(
+            worker_session,
+            worker_turn,
+            "compact_agent",
+            function_payload(json!({"target": "child"})),
+        ))
+        .await
+        .expect("nested agent should compact its direct child");
+    let (content, success) = expect_text_output(output);
+    let result: serde_json::Value =
+        serde_json::from_str(&content).expect("compact_agent result should be json");
+    let submission_id = result
+        .get("submission_id")
+        .and_then(serde_json::Value::as_str)
+        .expect("accepted compaction should include a submission id");
+
+    assert!(!submission_id.is_empty());
+    assert_eq!(success, Some(true));
+    let compactions_after = compacted_thread_ids(&manager);
+    assert_eq!(compactions_after.len(), compactions_before.len() + 1);
+    assert_eq!(compactions_after.last(), Some(&child_id));
+}
+
+#[tokio::test]
+async fn multi_agent_v2_compact_agent_rejects_nonowners_and_unknown_targets_without_submission() {
+    let (manager, session, turn) = start_multi_agent_v2_root().await;
+    let worker_id = spawn_multi_agent_v2_child(session.clone(), turn.clone(), "worker").await;
+    let sibling_id = spawn_multi_agent_v2_child(session.clone(), turn.clone(), "sibling").await;
+    let worker = manager
+        .get_thread(worker_id)
+        .await
+        .expect("worker thread should exist");
+    let worker_session = worker.session.clone();
+    let worker_turn = worker_session.new_default_turn().await;
+    let child_id =
+        spawn_multi_agent_v2_child(worker_session.clone(), worker_turn.clone(), "child").await;
+    manager
+        .get_thread(child_id)
+        .await
+        .expect("child thread should exist");
+
+    let (unrelated_session, unrelated_turn) =
+        start_multi_agent_v2_thread(&manager, (*turn.config).clone()).await;
+    let unrelated_child_id =
+        spawn_multi_agent_v2_child(unrelated_session, unrelated_turn, "foreign").await;
+    manager
+        .get_thread(unrelated_child_id)
+        .await
+        .expect("unrelated target should exist");
+
+    assert_ne!(worker_id, sibling_id);
+    let compactions_before = compacted_thread_ids(&manager);
+    let known_worker_targets = [
+        ("self", "/root/worker", worker_id),
+        ("sibling", "/root/sibling", sibling_id),
+        ("ancestor", "/root", session.thread_id),
+    ];
+    for (relation, target, expected_id) in known_worker_targets {
+        let resolved_id = worker_session
+            .services
+            .agent_control
+            .resolve(
+                worker_session.thread_id,
+                worker_turn.parent_thread_id,
+                &worker_turn.session_source,
+                target,
+            )
+            .await
+            .expect("known target path should resolve before authorization check");
+        assert_eq!(resolved_id, expected_id);
+
+        let result = CompactAgentHandler
+            .handle(invocation(
+                worker_session.clone(),
+                worker_turn.clone(),
+                "compact_agent",
+                function_payload(json!({"target": target})),
+            ))
+            .await;
+        assert!(
+            result.is_err(),
+            "compact_agent should reject {relation} target"
+        );
+    }
+
+    let unknown_result = CompactAgentHandler
+        .handle(invocation(
+            worker_session.clone(),
+            worker_turn.clone(),
+            "compact_agent",
+            function_payload(json!({"target": "/root/worker/missing"})),
+        ))
+        .await;
+    assert!(unknown_result.is_err(), "unknown target should be rejected");
+
+    let indirect_id = session
+        .services
+        .agent_control
+        .resolve(
+            session.thread_id,
+            turn.parent_thread_id,
+            &turn.session_source,
+            "/root/worker/child",
+        )
+        .await
+        .expect("indirect descendant path should resolve before authorization check");
+    assert_eq!(indirect_id, child_id);
+    let indirect_result = CompactAgentHandler
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "compact_agent",
+            function_payload(json!({"target": "/root/worker/child"})),
+        ))
+        .await;
+    assert!(
+        indirect_result.is_err(),
+        "indirect descendant target should be rejected"
+    );
+
+    let unrelated_result = worker_session
+        .services
+        .agent_control
+        .compact(worker_id, unrelated_child_id)
+        .await;
+    assert!(
+        unrelated_result.is_err(),
+        "unrelated target should be rejected"
+    );
+
+    assert_eq!(compacted_thread_ids(&manager), compactions_before);
 }
 
 #[tokio::test]

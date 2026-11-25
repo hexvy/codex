@@ -133,9 +133,14 @@ pub async fn start_streaming_sse_server(
                                     return;
                                 }
                             };
-                            requests.lock().await.push(body);
+                            let response = {
+                                let mut requests = requests.lock().await;
+                                let response = take_next_stream(&state).await;
+                                requests.push(body);
+                                response
+                            };
                             request_notify.notify_one();
-                            let Some((chunks, completion)) = take_next_stream(&state).await else {
+                            let Some((chunks, completion)) = response else {
                                 let _ = write_http_response(&mut stream, /*status*/ 500, "no responses queued", "text/plain").await;
                                 return;
                             };
