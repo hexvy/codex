@@ -201,6 +201,45 @@ impl AgentControl for LocalAgentControl {
         })
     }
 
+    fn compact(&self, owner: ThreadId, child: ThreadId) -> BoxFuture<'_, Result<String>> {
+        Box::pin(async move {
+            if owner == child {
+                return Err(CodexErr::InvalidRequest(
+                    "cannot compact the requesting agent".to_string(),
+                ));
+            }
+            let state = self.runtime.upgrade()?;
+            let parent = state.get_thread(owner).await?;
+            self.validate_v2_parent(&parent, child).await?;
+            self.runtime.ensure_agent_known(child)?;
+            let (thread, residency_pin) = if let Ok(thread) = state.get_thread(child).await {
+                self.validate_loaded_v2_child(&thread, owner)?;
+                let pin = self.runtime.pin_v2_residency(&thread).await?;
+                self.validate_loaded_v2_child(&thread, owner)?;
+                (thread, pin)
+            } else {
+                let config = parent.session.get_config().await.as_ref().clone();
+                let reload_pin = self
+                    .ensure_v2_agent_loaded(config, child, Some(parent))
+                    .await?;
+                let thread = state.get_thread(child).await?;
+                self.validate_loaded_v2_child(&thread, owner)?;
+                if !reload_pin.as_ref().is_some_and(|pin| {
+                    std::sync::Arc::ptr_eq(
+                        tokio::sync::OwnedRwLockReadGuard::rwlock(pin),
+                        &thread.residency_gate,
+                    )
+                }) {
+                    return Err(CodexErr::ThreadNotFound(child));
+                }
+                (thread, reload_pin)
+            };
+            state
+                .send_pinned_op(&thread, Op::Compact, None, None, residency_pin, None)
+                .await
+        })
+    }
+
     fn interrupt(
         &self,
         caller: ThreadId,

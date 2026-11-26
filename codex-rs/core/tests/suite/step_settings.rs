@@ -2237,13 +2237,14 @@ async fn model_activation_uses_destination_metadata_defaults(
 async fn tool_messages_follow_mid_turn_model_changes() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
-    const MULTI_AGENT_TOOLS: [&str; 6] = [
+    const MULTI_AGENT_TOOLS: [&str; 7] = [
         "spawn_agent",
         "send_message",
         "followup_task",
         "wait_agent",
         "interrupt_agent",
         "list_agents",
+        "compact_agent",
     ];
 
     let parameters = |model: &str| {
@@ -2339,6 +2340,7 @@ async fn tool_messages_follow_mid_turn_model_changes() -> Result<()> {
                         wait_agent: tool_message("wait_agent"),
                         interrupt_agent: tool_message("interrupt_agent"),
                         list_agents: tool_message("list_agents"),
+                        compact_agent: tool_message("compact_agent"),
                         post: tool_message("post"),
                         ..Default::default()
                     }),

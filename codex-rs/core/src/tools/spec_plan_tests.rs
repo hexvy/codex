@@ -2765,6 +2765,7 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
         "wait_agent",
         "close_agent",
         "interrupt_agent",
+        "compact_agent",
         "send_message",
         "followup_task",
         "assign_task",
@@ -2821,6 +2822,7 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
         "followup_task",
         "wait_agent",
         "interrupt_agent",
+        "compact_agent",
         "list_agents",
         "send_input",
         "resume_agent",
@@ -2833,6 +2835,7 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
         "followup_task",
         "wait_agent",
         "interrupt_agent",
+        "compact_agent",
         "list_agents",
     ] {
         assert!(
@@ -2887,10 +2890,20 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
     })
     .await;
     direct_model_only.assert_visible_contains(&[MULTI_AGENT_V2_NAMESPACE]);
-    direct_model_only.assert_visible_lacks(&["spawn_agent", "send_message", "wait_agent"]);
+    direct_model_only.assert_visible_lacks(&[
+        "spawn_agent",
+        "send_message",
+        "wait_agent",
+        "compact_agent",
+    ]);
     assert_eq!(
         direct_model_only
             .exposure(&ToolName::namespaced(MULTI_AGENT_V2_NAMESPACE, "spawn_agent").to_string()),
+        ToolExposure::DirectModelOnly
+    );
+    assert_eq!(
+        direct_model_only
+            .exposure(&ToolName::namespaced(MULTI_AGENT_V2_NAMESPACE, "compact_agent").to_string()),
         ToolExposure::DirectModelOnly
     );
 }
@@ -2940,6 +2953,7 @@ async fn multi_agent_v2_can_disable_wait_agent() {
     assert_eq!(
         plan.namespace_function_names(MULTI_AGENT_V2_NAMESPACE),
         &[
+            "compact_agent".to_string(),
             "followup_task".to_string(),
             "interrupt_agent".to_string(),
             "list_agents".to_string(),
@@ -2991,6 +3005,7 @@ async fn v1_multi_agent_tools_defer_when_tool_search_available() {
         "wait_agent",
         "close_agent",
         "interrupt_agent",
+        "compact_agent",
     ]);
     for tool_name in [
         "spawn_agent",
@@ -3050,6 +3065,7 @@ async fn multi_agent_v2_can_use_configured_tool_namespace() {
         "followup_task",
         "wait_agent",
         "interrupt_agent",
+        "compact_agent",
         "list_agents",
     ] {
         namespaced.assert_visible_lacks(&[tool_name]);
@@ -3087,7 +3103,12 @@ async fn multi_agent_v2_namespace_is_supported_by_bedrock_provider() {
     .await;
 
     plan.assert_visible_contains(&["agents"]);
-    plan.assert_visible_lacks(&["spawn_agent", "send_message", "list_agents"]);
+    plan.assert_visible_lacks(&[
+        "spawn_agent",
+        "send_message",
+        "list_agents",
+        "compact_agent",
+    ]);
     assert!(
         !plan
             .registered_names
@@ -3096,6 +3117,10 @@ async fn multi_agent_v2_namespace_is_supported_by_bedrock_provider() {
     assert!(
         plan.registered_names
             .contains(&ToolName::namespaced("agents", "spawn_agent").to_string())
+    );
+    assert!(
+        plan.registered_names
+            .contains(&ToolName::namespaced("agents", "compact_agent").to_string())
     );
 }
 
@@ -3137,13 +3162,25 @@ async fn multi_agent_v2_bedrock_workers_only_delegate_when_model_supports_v2() {
 
         let spawn_agent_name = ToolName::namespaced("agents", "spawn_agent").to_string();
         let followup_task_name = ToolName::namespaced("agents", "followup_task").to_string();
+        let interrupt_agent_name = ToolName::namespaced("agents", "interrupt_agent").to_string();
+        let compact_agent_name = ToolName::namespaced("agents", "compact_agent").to_string();
         assert_eq!(plan.can_manage_children, supports_delegation);
         if supports_delegation {
             plan.assert_visible_contains(&["agents"]);
-            plan.assert_registered_contains(&[&spawn_agent_name, &followup_task_name]);
+            plan.assert_registered_contains(&[
+                &spawn_agent_name,
+                &followup_task_name,
+                &interrupt_agent_name,
+                &compact_agent_name,
+            ]);
         } else {
             plan.assert_visible_lacks(&["agents"]);
-            plan.assert_registered_lacks(&[&spawn_agent_name, &followup_task_name]);
+            plan.assert_registered_lacks(&[
+                &spawn_agent_name,
+                &followup_task_name,
+                &interrupt_agent_name,
+                &compact_agent_name,
+            ]);
         }
     }
 }
@@ -3176,6 +3213,7 @@ async fn multi_agent_catalog_code_mode_follows_tool_mode_and_preserves_runtime_f
                 "followup_task",
                 "wait_agent",
                 "interrupt_agent",
+                "compact_agent",
                 "list_agents",
             ] {
                 assert_eq!(
@@ -3239,6 +3277,7 @@ async fn code_mode_only_can_expose_namespaced_multi_agent_v2_as_normal_tools() {
         "followup_task",
         "wait_agent",
         "interrupt_agent",
+        "compact_agent",
         "list_agents",
     ] {
         assert!(

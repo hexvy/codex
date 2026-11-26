@@ -250,6 +250,7 @@ impl EventProcessorWithJsonOutput {
                         CollabAgentTool::SendMessage
                         | CollabAgentTool::FollowupTask
                         | CollabAgentTool::InterruptAgent
+                        | CollabAgentTool::CompactAgent
                         | CollabAgentTool::ListAgents => return None,
                         CollabAgentTool::SpawnAgent => CollabTool::SpawnAgent,
                         CollabAgentTool::SendInput => CollabTool::SendInput,

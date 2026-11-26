@@ -1266,6 +1266,79 @@ async fn cancelled_v2_send_finishes_reload_registration() {
     );
 }
 
+#[tokio::test]
+async fn compact_reloads_registered_evicted_v2_child() {
+    let (home, mut config) = test_config().await;
+    config.features.enable(Feature::MultiAgentV2).unwrap();
+    config.features.enable(Feature::Sqlite).unwrap();
+    config.multi_agent_v2.max_concurrent_threads_per_session = 2;
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (owner_id, owner) = harness.start_paginated_thread().await;
+    let control = owner
+        .session
+        .services
+        .local_agent_runtime
+        .control(owner.session.session_id());
+    let child =
+        spawn_v2_reload_test_child(&control, harness.config.clone(), &owner, "worker").await;
+    let child_id = child.thread_id;
+    let child_thread = harness.manager.get_thread(child_id).await.unwrap();
+    child_thread
+        .inject_response_items(vec![assistant_message(
+            "child persisted",
+            Some(MessagePhase::FinalAnswer),
+        )])
+        .await
+        .unwrap();
+    child_thread.session.mark_interrupted();
+    *child_thread.session.active_turn.lock().await = None;
+    assert_eq!(
+        harness
+            .manager
+            .try_evict_v2_thread(child_thread)
+            .await
+            .unwrap(),
+        ThreadEvictionOutcome::Evicted,
+    );
+    assert!(
+        control
+            .runtime
+            .registry
+            .evicted_environments(child_id)
+            .is_some()
+    );
+
+    let accepted_id = control
+        .compact(owner_id, child_id)
+        .await
+        .expect("compact should restore and submit to the registered child");
+    assert!(
+        !accepted_id.is_empty(),
+        "compact should return its accepted ID"
+    );
+    harness
+        .manager
+        .get_thread(child_id)
+        .await
+        .expect("compact should restore the child");
+    assert!(
+        control
+            .runtime
+            .registry
+            .evicted_environments(child_id)
+            .is_none()
+    );
+    let compact_was_submitted = harness
+        .manager
+        .captured_ops()
+        .into_iter()
+        .any(|(thread_id, op)| thread_id == child_id && matches!(op, Op::Compact));
+    assert!(
+        compact_was_submitted,
+        "compact should target the child thread"
+    );
+}
+
 #[derive(Clone, Copy)]
 enum V2ReloadRoute {
     Sender,

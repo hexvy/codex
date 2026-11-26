@@ -166,6 +166,7 @@ fn activity_summary(item: &ThreadItemPayload) -> Option<String> {
                 CollabAgentTool::SendMessage
                 | CollabAgentTool::FollowupTask
                 | CollabAgentTool::InterruptAgent
+                | CollabAgentTool::CompactAgent
                 | CollabAgentTool::ListAgents => return None,
                 CollabAgentTool::SpawnAgent => "Spawned an agent",
                 CollabAgentTool::SendInput => "Sent input to an agent",

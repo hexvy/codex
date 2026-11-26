@@ -1073,6 +1073,7 @@
         "sendMessage",
         "followupTask",
         "interruptAgent",
+        "compactAgent",
         "listAgents"
       ],
       "type": "string"

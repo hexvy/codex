@@ -739,6 +739,8 @@ pub struct MultiAgentToolMessages {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_agent: Option<ToolMessage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_agent: Option<ToolMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interrupt_agent: Option<ToolMessage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub list_agents: Option<ToolMessage>,
@@ -770,6 +772,7 @@ impl MultiAgentToolMessages {
             "send_message" => &self.send_message,
             "followup_task" => &self.followup_task,
             "wait_agent" => &self.wait_agent,
+            "compact_agent" => &self.compact_agent,
             "interrupt_agent" => &self.interrupt_agent,
             "list_agents" => &self.list_agents,
             "create_channel" => &self.create_channel,

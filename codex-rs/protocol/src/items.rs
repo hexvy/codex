@@ -353,6 +353,7 @@ pub enum CollabAgentTool {
     SendMessage,
     FollowupTask,
     InterruptAgent,
+    CompactAgent,
     ListAgents,
 }
 

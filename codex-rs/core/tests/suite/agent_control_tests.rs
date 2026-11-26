@@ -233,6 +233,10 @@ impl AgentControl for TestAgentControl {
         })
     }
 
+    fn compact(&self, _owner: ThreadId, _child: ThreadId) -> BoxFuture<'_, CodexResult<String>> {
+        panic!("unexpected agent compact")
+    }
+
     fn interrupt(
         &self,
         _caller: ThreadId,

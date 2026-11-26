@@ -231,6 +231,7 @@ pub(crate) fn tool_call_history_cell(
         CollabAgentTool::SendMessage
         | CollabAgentTool::FollowupTask
         | CollabAgentTool::InterruptAgent
+        | CollabAgentTool::CompactAgent
         | CollabAgentTool::ListAgents => None,
         CollabAgentTool::SpawnAgent => {
             if matches!(status, CollabAgentToolCallStatus::InProgress) {

@@ -692,6 +692,7 @@ class CollabAgentTool(Enum):
     send_message = "sendMessage"
     followup_task = "followupTask"
     interrupt_agent = "interruptAgent"
+    compact_agent = "compactAgent"
     list_agents = "listAgents"
 
 
